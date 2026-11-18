@@ -27,9 +27,13 @@ systemd-based only.
 Not supported: Alpine, Arch, openSUSE, Amazon Linux, and Debian/Ubuntu
 derivatives such as Mint. Containers without systemd also won't work.
 
-> **Testing status:** the script passes `bash -n` and its argument validation
-> works, but it has **not yet been run end to end** on each distro. Try it on a
-> disposable VM first and report anything that breaks.
+> **Testing status:** run end to end (fresh install and a second run) in systemd
+> containers on **Ubuntu 24.04**, **Debian 12** and **Rocky Linux 9**, each with a
+> PHP page served through Nginx + PHP-FPM and a PostgreSQL login using the
+> generated credentials. Not yet run on: Fedora, RHEL itself, AlmaLinux, Oracle
+> Linux, CentOS Stream, older/newer releases, or with the firewall step enabled
+> (`--skip-firewall` was used) or with SELinux enforcing. Treat those as untested
+> and try on a disposable VM first.
 
 ## Usage
 

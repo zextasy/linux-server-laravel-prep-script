@@ -145,7 +145,7 @@ log "Detected $PRETTY_NAME ($FAMILY, package manager: $PM)"
 pkg_update() {
   case "$PM" in
     apt) apt-get update -y ;;
-    dnf) dnf makecache -y ;;
+    dnf) dnf makecache -y || warn "could not refresh all repository metadata; continuing" ;;
   esac
 }
 pkg_install() {
@@ -186,7 +186,8 @@ setup_repos_apt() {
 }
 
 setup_repos_dnf() {
-  pkg_install ca-certificates curl
+  pkg_install ca-certificates
+  have curl || pkg_install curl   # EL images often ship curl-minimal, which conflicts with curl
   local arch; arch="$(uname -m)"
   if [[ "$FAMILY" == "rhel" ]]; then
     # EPEL (supervisor, deps) + CodeReady/CRB (some -devel style deps for PHP libs)
@@ -349,9 +350,11 @@ create_database() {
 
   if [[ "$(psql_admin -tAc "SELECT 1 FROM pg_roles WHERE rolname='${DB_USER}'")" != "1" ]]; then
     local pw
-    pw="$(head -c 48 /dev/urandom | base64 | tr -dc 'A-Za-z0-9' | head -c 32)"
+    pw="$(head -c 96 /dev/urandom | base64 -w0 | tr -dc 'A-Za-z0-9' | cut -c1-32)"
     # stdin + :'pw' lets psql quote the value safely
-    printf "CREATE ROLE %s LOGIN PASSWORD :'pw';\n" "$DB_USER" | psql_admin -v "pw=${pw}" >/dev/null
+    # Force scram hashing: PostgreSQL < 14 defaults to md5, which pg_hba's scram-sha-256 would reject.
+    printf "SET password_encryption = 'scram-sha-256';\nCREATE ROLE %s LOGIN PASSWORD :'pw';\n" "$DB_USER" \
+      | psql_admin -v "pw=${pw}" >/dev/null
     umask 077
     cat > "$cred_file" <<EOF
 DB_CONNECTION=pgsql
@@ -397,7 +400,7 @@ install_tools() {
     pkg_try supervisor
   fi
   svc_enable "$CRON_SERVICE"
-  if systemctl list-unit-files "${SUPERVISOR_SERVICE}.service" 2>/dev/null | grep -q "$SUPERVISOR_SERVICE"; then
+  if systemctl cat "${SUPERVISOR_SERVICE}.service" >/dev/null 2>&1; then
     svc_enable "$SUPERVISOR_SERVICE"
   fi
 }
@@ -518,8 +521,8 @@ setup_firewall() {
 # --------------------------------------------------------------------------
 if [[ "$PM" == apt ]]; then setup_repos_apt; else setup_repos_dnf; fi
 install_php
+install_nginx    # before configure_fpm: on RHEL it creates the 'nginx' user the FPM pool runs as
 configure_fpm
-install_nginx
 install_postgres
 create_database
 install_redis
