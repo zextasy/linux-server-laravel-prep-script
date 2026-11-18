@@ -150,8 +150,8 @@ pkg_update() {
 }
 pkg_install() {
   case "$PM" in
-    apt) apt-get install -y "$@" ;;
-    dnf) dnf install -y "$@" ;;
+    apt) apt-get -o Acquire::Retries=5 install -y "$@" ;;
+    dnf) dnf install -y --setopt=retries=5 "$@" ;;
   esac
 }
 # Best-effort install: one package at a time, warn instead of failing.
@@ -262,6 +262,9 @@ install_nginx() {
   local conf="/etc/nginx/conf.d/${APP_NAME}.conf"
   local listen_opts=""
   [[ "$DOMAIN" == "_" ]] && listen_opts=" default_server"
+  local listen6=""
+  # Only listen on IPv6 if the kernel has it (nginx fails to start otherwise).
+  [[ -s /proc/net/if_inet6 ]] && listen6="    listen [::]:80${listen_opts};"
 
   if [[ -e "$conf" ]]; then
     warn "$conf already exists; leaving it untouched"
@@ -269,7 +272,7 @@ install_nginx() {
     cat > "$conf" <<'EOF'
 server {
     listen 80@LISTEN_OPTS@;
-    listen [::]:80@LISTEN_OPTS@;
+@LISTEN6@
     server_name @DOMAIN@;
     root @APP_DIR@/public;
 
@@ -302,6 +305,7 @@ server {
 }
 EOF
     sed -i \
+      -e "s|^@LISTEN6@\$|${listen6}|" \
       -e "s|@LISTEN_OPTS@|${listen_opts}|g" \
       -e "s|@DOMAIN@|${DOMAIN}|g" \
       -e "s|@APP_DIR@|${APP_DIR}|g" \
