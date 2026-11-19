@@ -1,10 +1,11 @@
 #!/usr/bin/env bash
 #
-# laravel-prep.sh - prepare a fresh Linux server to host a Laravel application.
+# laravel-prep.sh - one-time setup of a Linux server for hosting Laravel apps.
 #
 # Installs and configures: PHP (+ FPM and the extensions Laravel needs), Nginx,
-# PostgreSQL, Redis, Composer, Node.js, Supervisor (queue worker), a cron-based
-# scheduler entry, a deploy user, and a firewall.
+# PostgreSQL, Redis, Composer, Node.js, Supervisor, cron, SELinux booleans and a
+# firewall. It does NOT set up any individual app: run `laravel-app` (installed
+# by this script from laravel-app.sh) from each app's directory for that.
 #
 # Supported: Ubuntu, Debian, RHEL, CentOS Stream, Rocky Linux, AlmaLinux,
 #            Oracle Linux, Fedora (all systemd based).
@@ -19,11 +20,6 @@ trap 'echo "ERROR: line $LINENO: command failed: $BASH_COMMAND" >&2' ERR
 # --------------------------------------------------------------------------
 PHP_VERSION="${PHP_VERSION:-8.4}"
 NODE_MAJOR="${NODE_MAJOR:-22}"
-APP_NAME="${APP_NAME:-laravel}"
-DOMAIN="${DOMAIN:-_}"
-DEPLOY_USER="${DEPLOY_USER:-deploy}"
-DB_NAME="${DB_NAME:-}"
-DB_USER="${DB_USER:-}"
 INSTALL_NODE=1
 SETUP_FIREWALL=1
 
@@ -33,11 +29,6 @@ Usage: sudo $0 [options]
 
   --php-version X.Y     PHP version to install            (default: $PHP_VERSION)
   --node-version N      Node.js major version             (default: $NODE_MAJOR)
-  --app-name NAME       App name: dir, vhost, DB defaults (default: $APP_NAME)
-  --domain DOMAIN       Nginx server_name                 (default: catch-all)
-  --deploy-user USER    Unix user that owns the code      (default: $DEPLOY_USER)
-  --db-name NAME        PostgreSQL database               (default: app name)
-  --db-user NAME        PostgreSQL role                   (default: app name)
   --no-node             Skip Node.js
   --skip-firewall       Do not touch the firewall
   -h, --help            Show this help
@@ -48,11 +39,6 @@ while [[ $# -gt 0 ]]; do
   case "$1" in
     --php-version)   PHP_VERSION="${2:?}"; shift 2 ;;
     --node-version)  NODE_MAJOR="${2:?}"; shift 2 ;;
-    --app-name)      APP_NAME="${2:?}"; shift 2 ;;
-    --domain)        DOMAIN="${2:?}"; shift 2 ;;
-    --deploy-user)   DEPLOY_USER="${2:?}"; shift 2 ;;
-    --db-name)       DB_NAME="${2:?}"; shift 2 ;;
-    --db-user)       DB_USER="${2:?}"; shift 2 ;;
     --no-node)       INSTALL_NODE=0; shift ;;
     --skip-firewall) SETUP_FIREWALL=0; shift ;;
     -h|--help)       usage; exit 0 ;;
@@ -68,19 +54,11 @@ warn() { printf '\033[1;33mWARN: %s\033[0m\n' "$*" >&2; }
 die()  { printf '\033[1;31mERROR: %s\033[0m\n' "$*" >&2; exit 1; }
 have() { command -v "$1" >/dev/null 2>&1; }
 
-# Every value below ends up in config files and SQL, so keep them strict.
+# Every value below ends up in package names and config files, so keep them strict.
 [[ "$PHP_VERSION" =~ ^[0-9]+\.[0-9]+$ ]]     || die "Invalid --php-version: $PHP_VERSION"
 [[ "$NODE_MAJOR" =~ ^[0-9]+$ ]]              || die "Invalid --node-version: $NODE_MAJOR"
-[[ "$APP_NAME" =~ ^[a-z][a-z0-9_]*$ ]]       || die "--app-name must match ^[a-z][a-z0-9_]*$"
-[[ "$DEPLOY_USER" =~ ^[a-z_][a-z0-9_-]*$ ]]  || die "Invalid --deploy-user: $DEPLOY_USER"
-[[ "$DOMAIN" =~ ^[A-Za-z0-9._-]+$ ]]         || die "Invalid --domain: $DOMAIN"
-DB_NAME="${DB_NAME:-$APP_NAME}"
-DB_USER="${DB_USER:-$APP_NAME}"
-[[ "$DB_NAME" =~ ^[a-z_][a-z0-9_]*$ ]]       || die "--db-name must match ^[a-z_][a-z0-9_]*$"
-[[ "$DB_USER" =~ ^[a-z_][a-z0-9_]*$ ]]       || die "--db-user must match ^[a-z_][a-z0-9_]*$"
 
 PHP_NODOT="${PHP_VERSION/./}"
-APP_DIR="/var/www/$APP_NAME"
 
 [[ $EUID -eq 0 ]] || die "Run as root (e.g. sudo $0)"
 [[ -d /run/systemd/system ]] || die "systemd is required (containers without systemd are not supported)"
@@ -122,7 +100,7 @@ case "$FAMILY" in
     PHP_INI_DIRS=("/etc/php/${PHP_VERSION}/fpm/conf.d" "/etc/php/${PHP_VERSION}/cli/conf.d")
     PG_SERVICE=postgresql
     SUPERVISOR_SERVICE=supervisor
-    SUPERVISOR_CONF="/etc/supervisor/conf.d/${APP_NAME}-worker.conf"
+    SUPERVISOR_CONF_DIR=/etc/supervisor/conf.d; SUPERVISOR_CONF_EXT=conf
     CRON_SERVICE=cron
     ;;
   rhel|fedora)
@@ -135,7 +113,7 @@ case "$FAMILY" in
     PHP_INI_DIRS=("/etc/opt/remi/php${PHP_NODOT}/php.d")
     PG_SERVICE=postgresql
     SUPERVISOR_SERVICE=supervisord
-    SUPERVISOR_CONF="/etc/supervisord.d/${APP_NAME}-worker.ini"
+    SUPERVISOR_CONF_DIR=/etc/supervisord.d; SUPERVISOR_CONF_EXT=ini
     CRON_SERVICE=crond
     ;;
 esac
@@ -265,61 +243,7 @@ configure_fpm() {
 install_nginx() {
   log "Installing Nginx"
   pkg_install nginx
-  local conf="/etc/nginx/conf.d/${APP_NAME}.conf"
-  local listen_opts=""
-  [[ "$DOMAIN" == "_" ]] && listen_opts=" default_server"
-  local listen6=""
-  # Only listen on IPv6 if the kernel has it (nginx fails to start otherwise).
-  [[ -s /proc/net/if_inet6 ]] && listen6="    listen [::]:80${listen_opts};"
-
-  if [[ -e "$conf" ]]; then
-    warn "$conf already exists; leaving it untouched"
-  else
-    cat > "$conf" <<'EOF'
-server {
-    listen 80@LISTEN_OPTS@;
-@LISTEN6@
-    server_name @DOMAIN@;
-    root @APP_DIR@/public;
-
-    add_header X-Frame-Options "SAMEORIGIN";
-    add_header X-Content-Type-Options "nosniff";
-
-    index index.php;
-    charset utf-8;
-    client_max_body_size 64M;
-
-    location / {
-        try_files $uri $uri/ /index.php?$query_string;
-    }
-
-    location = /favicon.ico { access_log off; log_not_found off; }
-    location = /robots.txt  { access_log off; log_not_found off; }
-
-    error_page 404 /index.php;
-
-    location ~ ^/index\.php(/|$) {
-        fastcgi_pass @FPM_PASS@;
-        fastcgi_param SCRIPT_FILENAME $realpath_root$fastcgi_script_name;
-        include fastcgi_params;
-        fastcgi_hide_header X-Powered-By;
-    }
-
-    location ~ /\.(?!well-known).* {
-        deny all;
-    }
-}
-EOF
-    sed -i \
-      -e "s|^@LISTEN6@\$|${listen6}|" \
-      -e "s|@LISTEN_OPTS@|${listen_opts}|g" \
-      -e "s|@DOMAIN@|${DOMAIN}|g" \
-      -e "s|@APP_DIR@|${APP_DIR}|g" \
-      -e "s|@FPM_PASS@|${FPM_PASS}|g" \
-      "$conf"
-  fi
-
-  rm -f /etc/nginx/sites-enabled/default   # Debian/Ubuntu stock site
+  rm -f /etc/nginx/sites-enabled/default   # Debian/Ubuntu stock site; app vhosts are added by laravel-app
   nginx -t
   svc_enable nginx
   systemctl reload nginx
@@ -343,41 +267,6 @@ install_postgres() {
     fi
   fi
   svc_enable "$PG_SERVICE"
-}
-
-psql_admin() { (cd / && runuser -u postgres -- psql -v ON_ERROR_STOP=1 "$@"); }
-
-create_database() {
-  log "Creating PostgreSQL role '${DB_USER}' and database '${DB_NAME}'"
-  local cred_dir=/root/.laravel-prep cred_file
-  cred_file="$cred_dir/${APP_NAME}.env"
-  mkdir -p "$cred_dir"; chmod 700 "$cred_dir"
-
-  if [[ "$(psql_admin -tAc "SELECT 1 FROM pg_roles WHERE rolname='${DB_USER}'")" != "1" ]]; then
-    local pw
-    pw="$(head -c 96 /dev/urandom | base64 -w0 | tr -dc 'A-Za-z0-9' | cut -c1-32)"
-    # stdin + :'pw' lets psql quote the value safely
-    # Force scram hashing: PostgreSQL < 14 defaults to md5, which pg_hba's scram-sha-256 would reject.
-    printf "SET password_encryption = 'scram-sha-256';\nCREATE ROLE %s LOGIN PASSWORD :'pw';\n" "$DB_USER" \
-      | psql_admin -v "pw=${pw}" >/dev/null
-    umask 077
-    cat > "$cred_file" <<EOF
-DB_CONNECTION=pgsql
-DB_HOST=127.0.0.1
-DB_PORT=5432
-DB_DATABASE=${DB_NAME}
-DB_USERNAME=${DB_USER}
-DB_PASSWORD=${pw}
-EOF
-    umask 022
-    echo "Credentials saved to $cred_file (paste into your app's .env)"
-  else
-    echo "Role '${DB_USER}' already exists; password left unchanged."
-  fi
-
-  if [[ "$(psql_admin -tAc "SELECT 1 FROM pg_database WHERE datname='${DB_NAME}'")" != "1" ]]; then
-    psql_admin -c "CREATE DATABASE ${DB_NAME} OWNER ${DB_USER}" >/dev/null
-  fi
 }
 
 install_redis() {
@@ -446,54 +335,38 @@ install_node() {
 }
 
 # --------------------------------------------------------------------------
-# App skeleton: deploy user, directories, permissions, SELinux, worker, cron
+# SELinux (RHEL family): let nginx/php-fpm reach PostgreSQL/Redis. Per-app file
+# labels are applied by laravel-app.
 # --------------------------------------------------------------------------
-setup_app() {
-  log "Preparing ${APP_DIR} and deploy user '${DEPLOY_USER}'"
-  id "$DEPLOY_USER" >/dev/null 2>&1 || useradd -m -s /bin/bash "$DEPLOY_USER"
-  mkdir -p "$APP_DIR"
-  chown "$DEPLOY_USER:$WEB_GROUP" "$APP_DIR"
-  chmod 2750 "$APP_DIR"
+configure_selinux() {
+  have getenforce && [[ "$(getenforce)" != "Disabled" ]] || return 0
+  log "Configuring SELinux"
+  pkg_try policycoreutils-python-utils
+  setsebool -P httpd_can_network_connect 1 || warn "setsebool httpd_can_network_connect failed"
+  setsebool -P httpd_can_network_connect_db 1 || warn "setsebool httpd_can_network_connect_db failed"
+}
 
-  # Scheduler: runs only once an app has been deployed.
-  cat > "/etc/cron.d/laravel-${APP_NAME}" <<EOF
-# Managed by laravel-prep.sh
-* * * * * ${WEB_USER} [ -f ${APP_DIR}/artisan ] && cd ${APP_DIR} && $(command -v php || echo "$PHP_BIN") artisan schedule:run >> /dev/null 2>&1
-EOF
-  chmod 644 "/etc/cron.d/laravel-${APP_NAME}"
+# --------------------------------------------------------------------------
+# Hand-off to laravel-app: record what was detected, install the per-app script
+# --------------------------------------------------------------------------
+write_state() {
+  log "Recording server settings in /etc/laravel-prep/server.conf"
+  mkdir -p /etc/laravel-prep
+  {
+    echo "# Written by laravel-prep.sh and read by laravel-app. Do not edit by hand."
+    for v in FAMILY PM WEB_USER WEB_GROUP PHP_VERSION PHP_BIN FPM_PASS \
+             SUPERVISOR_SERVICE SUPERVISOR_CONF_DIR SUPERVISOR_CONF_EXT; do
+      printf '%s=%q\n' "$v" "${!v}"
+    done
+  } > /etc/laravel-prep/server.conf
+  chmod 644 /etc/laravel-prep/server.conf
 
-  # Queue worker: defined but not started (autostart=false) until the app exists.
-  if [[ -d "$(dirname "$SUPERVISOR_CONF")" ]]; then
-    cat > "$SUPERVISOR_CONF" <<EOF
-[program:${APP_NAME}-worker]
-command=$(command -v php || echo "$PHP_BIN") ${APP_DIR}/artisan queue:work --sleep=3 --tries=3 --max-time=3600
-directory=${APP_DIR}
-user=${WEB_USER}
-autostart=false
-autorestart=true
-stopwaitsecs=3600
-numprocs=1
-redirect_stderr=true
-stdout_logfile=/var/log/${APP_NAME}-worker.log
-EOF
-  fi
-
-  # SELinux (RHEL family): allow nginx/php-fpm to reach PostgreSQL/Redis and write storage.
-  if have getenforce && [[ "$(getenforce)" != "Disabled" ]]; then
-    log "Configuring SELinux"
-    pkg_try policycoreutils-python-utils
-    setsebool -P httpd_can_network_connect 1 || warn "setsebool httpd_can_network_connect failed"
-    setsebool -P httpd_can_network_connect_db 1 || warn "setsebool httpd_can_network_connect_db failed"
-    if have semanage; then
-      local d
-      for d in storage bootstrap/cache; do
-        semanage fcontext -a -t httpd_sys_rw_content_t "${APP_DIR}/${d}(/.*)?" 2>/dev/null \
-          || semanage fcontext -m -t httpd_sys_rw_content_t "${APP_DIR}/${d}(/.*)?" || true
-      done
-      restorecon -R "$APP_DIR" || true
-    else
-      warn "semanage not available; label storage/ and bootstrap/cache manually (see README)"
-    fi
+  local here; here="$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd || true)"
+  if [[ -n "$here" && -f "$here/laravel-app.sh" ]]; then
+    install -m 0755 "$here/laravel-app.sh" /usr/local/sbin/laravel-app
+    echo "Installed /usr/local/sbin/laravel-app"
+  else
+    warn "laravel-app.sh not found next to this script; install it manually as /usr/local/sbin/laravel-app"
   fi
 }
 
@@ -529,13 +402,13 @@ install_php
 install_nginx    # before configure_fpm: on RHEL it creates the 'nginx' user the FPM pool runs as
 configure_fpm
 install_postgres
-create_database
 install_redis
 install_tools
 install_composer
 [[ "$INSTALL_NODE" -eq 1 ]] && install_node
-setup_app
+configure_selinux
 [[ "$SETUP_FIREWALL" -eq 1 ]] && setup_firewall
+write_state
 
 log "Done"
 cat <<EOF
@@ -546,7 +419,5 @@ cat <<EOF
   Composer   : $(composer --version 2>/dev/null | awk '{print $3}')
   Node.js    : $(node -v 2>/dev/null || echo skipped)
 
-  App dir    : ${APP_DIR}  (owner ${DEPLOY_USER}, group ${WEB_GROUP})
-  DB creds   : /root/.laravel-prep/${APP_NAME}.env
-  Next steps : see README.md ("After the script runs")
+  Next step  : cd into a Laravel app directory and run:  sudo laravel-app --domain example.com
 EOF

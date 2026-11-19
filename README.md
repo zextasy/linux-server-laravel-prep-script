@@ -1,18 +1,39 @@
 # linux-server-laravel-prep-script
 
-One script that prepares a fresh Linux server to host a Laravel application.
+Two scripts for hosting Laravel apps on a Linux server:
 
-## What it sets up
+| Script | Run | Purpose |
+|--------|-----|---------|
+| `laravel-prep.sh` | **once per server** | Installs PHP, Nginx, PostgreSQL, Redis, Composer, Node.js, Supervisor, cron; configures the firewall |
+| `laravel-app.sh` | **once per app**, from the app's directory | Gives that app its own Nginx vhost, PostgreSQL role + database, scheduler, queue worker and permissions |
+
+`laravel-prep.sh` records what it detected in `/etc/laravel-prep/server.conf`
+and installs `laravel-app.sh` as `/usr/local/sbin/laravel-app`, so the per-app
+step needs no OS detection and works the same on every supported distro. You
+can host as many apps as you like on one server.
+
+## What gets set up
+
+**Server (`laravel-prep.sh`)**
 
 | Component | Details |
 |-----------|---------|
 | PHP | 8.4 by default (`--php-version`), FPM + the extensions Laravel needs (`pgsql`, `mbstring`, `xml`, `curl`, `zip`, `bcmath`, `intl`, `gd`, `redis`, `opcache`) and sane `php.ini` overrides |
-| Web server | Nginx with a Laravel-ready vhost at `/etc/nginx/conf.d/<app>.conf` |
-| Database | PostgreSQL (distro packages), plus a role and database for the app with a random password |
+| Web server | Nginx (no sites yet) |
+| Database | PostgreSQL (distro packages), listening on localhost |
 | Cache/queues | Redis (Valkey on EL10) |
-| Tooling | Composer (installer checksum verified), Node.js (tarball checksum verified), git, unzip |
-| Processes | Supervisor queue-worker definition (not started), cron entry for `schedule:run` |
-| Hardening | Dedicated deploy user, firewall (ufw / firewalld) allowing SSH, 80 and 443, SELinux booleans and labels on RHEL-family |
+| Tooling | Composer (installer checksum verified), Node.js (tarball checksum verified), git, unzip, cron, Supervisor |
+| Hardening | Firewall (ufw / firewalld) allowing SSH, 80 and 443; SELinux booleans on RHEL-family |
+
+**Per app (`laravel-app.sh`)**
+
+| Component | Details |
+|-----------|---------|
+| Nginx vhost | `/etc/nginx/conf.d/<app>.conf`, root `<app dir>/public` |
+| Database | Role + database named after the app, random password saved to `/root/.laravel-prep/<app>.env` |
+| Scheduler | `/etc/cron.d/laravel-<app>` running `schedule:run` every minute |
+| Queue worker | Supervisor program `<app>-worker` (defined, not started unless `--start-worker`) |
+| Permissions | Group set to the web server's group, world-write removed, `storage/` and `bootstrap/cache` group-writable, `.env` mode 640, SELinux labels on RHEL-family |
 
 ## Supported distributions
 
@@ -27,9 +48,13 @@ systemd-based only.
 Not supported: Alpine, Arch, openSUSE, Amazon Linux, and Debian/Ubuntu
 derivatives such as Mint. Containers without systemd also won't work.
 
-> **Testing status:** run end to end (fresh install, then a second run) in systemd
-> containers, each serving a PHP page through Nginx + PHP-FPM and logging in to
-> PostgreSQL with the generated credentials:
+> **Testing status:** the server script was run end to end (fresh install, then a
+> second run) in systemd containers on each distro below, each serving a PHP page
+> through Nginx + PHP-FPM. The split into two scripts was then re-verified with
+> two apps on a single server on **Ubuntu 24.04** and **Rocky Linux 9** (each app
+> served its own page and logged in to its own database); the other distros were
+> tested with the earlier single-script version, whose server part is unchanged
+> apart from the app/database steps moving to `laravel-app`.
 >
 > | Distro | PostgreSQL | Notes |
 > |--------|-----------|-------|
@@ -50,74 +75,101 @@ derivatives such as Mint. Containers without systemd also won't work.
 
 ## Usage
 
+### 1. Prepare the server (once)
+
 ```bash
 git clone https://github.com/zextasy/linux-server-laravel-prep-script.git
 cd linux-server-laravel-prep-script
-sudo ./laravel-prep.sh --app-name myapp --domain example.com
+sudo ./laravel-prep.sh
 ```
-
-Read the script before running it. It installs packages, edits the firewall and
-runs as root.
-
-### Options
 
 | Option | Default | Description |
 |--------|---------|-------------|
 | `--php-version X.Y` | `8.4` | PHP version |
 | `--node-version N` | `22` | Node.js major version |
-| `--app-name NAME` | `laravel` | Used for `/var/www/NAME`, the vhost, and DB defaults (`[a-z][a-z0-9_]*`) |
-| `--domain DOMAIN` | catch-all | Nginx `server_name` |
-| `--deploy-user USER` | `deploy` | Unix user that owns the code |
-| `--db-name NAME` | app name | PostgreSQL database |
-| `--db-user NAME` | app name | PostgreSQL role |
 | `--no-node` | | Skip Node.js |
 | `--skip-firewall` | | Leave the firewall alone |
 
-The script is safe to re-run: existing roles, databases, vhosts and users are
-left as they are (an existing vhost is never overwritten).
+Read the scripts before running them: they install packages, edit the firewall
+and run as root. Re-running `laravel-prep.sh` is safe, and also refreshes the
+installed `laravel-app`.
 
-## After the script runs
+### 2. Set up each app (once per app)
 
-1. **Database credentials** are in `/root/.laravel-prep/<app>.env`. Copy the
-   `DB_*` lines into your app's `.env`.
-2. **Deploy your code** to `/var/www/<app>` as the deploy user:
+Put the app's code on the server (anywhere with a plain path, e.g.
+`/var/www/myapp`), then from **inside the app directory**:
+
+```bash
+cd /var/www/myapp
+sudo laravel-app --domain myapp.example.com --update-env
+```
+
+Run it again in another directory for the next app:
+
+```bash
+cd /var/www/shop && sudo laravel-app --domain shop.example.com --update-env
+```
+
+| Option | Default | Description |
+|--------|---------|-------------|
+| `--domain DOMAIN` | catch-all | Nginx `server_name`. Only one app can use the catch-all; give the others a domain |
+| `--name NAME` | from the directory name | Used for the vhost, cron, worker and DB defaults (`Blog-Site` becomes `blog_site`) |
+| `--path DIR` | current directory | Set up an app without `cd`-ing into it |
+| `--db-name` / `--db-user` | app name | PostgreSQL database / role |
+| `--update-env` | | Write the `DB_*` settings into the app's `.env` (only when the role is newly created) |
+| `--no-db` | | Skip the database (e.g. you use an external one) |
+| `--no-scheduler` | | Skip the cron entry |
+| `--no-worker` | | Skip the queue-worker definition |
+| `--start-worker` | | Start the queue worker now |
+| `--force` | | Continue even if there is no `artisan` file |
+
+`laravel-app` is safe to re-run: an existing role keeps its password and an
+existing vhost is never overwritten (delete `/etc/nginx/conf.d/<app>.conf` and
+re-run to regenerate it). If Nginx rejects a new vhost, it is removed again.
+
+## After `laravel-app` runs
+
+1. **Database credentials** are in `/root/.laravel-prep/<app>.env` (or already
+   in `.env` if you used `--update-env`).
+2. **Install and migrate** as the user who owns the code:
    ```bash
-   sudo -u deploy git clone <repo> /var/www/myapp
-   cd /var/www/myapp
-   sudo -u deploy composer install --no-dev --optimize-autoloader
-   sudo -u deploy npm ci && sudo -u deploy npm run build
-   sudo -u deploy php artisan key:generate && sudo -u deploy php artisan migrate --force
+   composer install --no-dev --optimize-autoloader
+   npm ci && npm run build
+   php artisan key:generate && php artisan migrate --force
    ```
-3. **Make `storage` and `bootstrap/cache` writable by PHP-FPM.** The group is
-   `www-data` on Debian/Ubuntu and `nginx` on RHEL-family:
-   ```bash
-   sudo chgrp -R www-data /var/www/myapp/storage /var/www/myapp/bootstrap/cache
-   sudo chmod -R ug+rwX   /var/www/myapp/storage /var/www/myapp/bootstrap/cache
-   ```
-   On SELinux systems the script already labels these paths; run
-   `sudo restorecon -R /var/www/myapp` after deploying.
-4. **Start the queue worker** (if you use queues):
+3. **Start the queue worker** (if you use queues), unless you passed `--start-worker`:
    ```bash
    sudo supervisorctl reread && sudo supervisorctl update
-   sudo supervisorctl start myapp-worker
+   sudo supervisorctl start <app>-worker
    ```
-   The scheduler cron entry (`/etc/cron.d/laravel-<app>`) starts working as soon
-   as `artisan` exists.
-5. **Enable HTTPS** with [certbot](https://certbot.eff.org/) once the domain
+4. **Enable HTTPS** with [certbot](https://certbot.eff.org/) once the domain
    points at the server.
+
+If you re-deploy files with a different group, run `sudo laravel-app` again to
+restore the permissions.
 
 ## Notes and caveats
 
-- **Firewall:** the script detects your SSH port via `sshd -T` (falling back to
-  22) and allows it before enabling the firewall. Use `--skip-firewall` if you
-  manage firewalling elsewhere.
-- **PostgreSQL version** is whatever the distro ships (EL8 is pinned to the
-  16 stream). Postgres listens on localhost only.
+- **Where to keep apps:** the web server user must be able to walk down to the
+  app. Directories under `/home/<user>` are usually mode 700, which blocks
+  Nginx; `laravel-app` warns when it detects this. `/var/www/<app>` is the
+  simplest choice. Paths may only contain letters, digits and `. _ / -`.
+- **Permissions model:** the app keeps its owner (your deploy user); only the
+  group changes to the web group (`www-data` on Debian/Ubuntu, `nginx` on
+  RHEL-family). World-write is removed.
+- **Firewall:** `laravel-prep.sh` detects your SSH port via `sshd -T` (falling
+  back to 22) and allows it before enabling the firewall. Use `--skip-firewall`
+  if you manage firewalling elsewhere.
+- **PostgreSQL version** is whatever the distro ships (EL8 is pinned to the 16
+  stream).
 - **RHEL-family PHP** uses Remi's parallel-install packages. The CLI is
   available as `php` (symlinked to `php84` or similar), FPM listens on
-  `127.0.0.1:9000`, and its config lives under `/etc/opt/remi/phpXY/`.
+  `127.0.0.1:9000`, and its config lives under `/etc/opt/remi/phpXY/`. All apps
+  share one FPM pool.
 - **RHEL proper** needs an active subscription for the CodeReady Builder repo;
   the script warns and continues if that can't be enabled.
+- **Nginx reloads are asynchronous:** a new vhost can take a second or two to
+  start answering after `laravel-app` returns.
 
 ## License
 
