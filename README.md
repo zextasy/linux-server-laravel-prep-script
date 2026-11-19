@@ -27,13 +27,26 @@ systemd-based only.
 Not supported: Alpine, Arch, openSUSE, Amazon Linux, and Debian/Ubuntu
 derivatives such as Mint. Containers without systemd also won't work.
 
-> **Testing status:** run end to end (fresh install and a second run) in systemd
-> containers on **Ubuntu 24.04**, **Debian 12** and **Rocky Linux 9**, each with a
-> PHP page served through Nginx + PHP-FPM and a PostgreSQL login using the
-> generated credentials. Not yet run on: Fedora, RHEL itself, AlmaLinux, Oracle
-> Linux, CentOS Stream, older/newer releases, or with the firewall step enabled
-> (`--skip-firewall` was used) or with SELinux enforcing. Treat those as untested
-> and try on a disposable VM first.
+> **Testing status:** run end to end (fresh install, then a second run) in systemd
+> containers, each serving a PHP page through Nginx + PHP-FPM and logging in to
+> PostgreSQL with the generated credentials:
+>
+> | Distro | PostgreSQL | Notes |
+> |--------|-----------|-------|
+> | Ubuntu 24.04 | 16 | |
+> | Debian 12 | 15 | |
+> | Rocky Linux 9 | 13 | |
+> | AlmaLinux 8 | 16 | uses the `postgresql:16` module stream |
+> | AlmaLinux 9 | 13 | |
+> | Oracle Linux 9 | 13 | uses `oracle-epel-release` |
+> | CentOS Stream 9 | 13 | |
+> | CentOS Stream 10 | 16 | Valkey instead of Redis |
+> | Fedora 43 | 18 | dnf5 |
+>
+> **Not tested:** RHEL itself (needs a subscription; Rocky/Alma/Oracle are
+> rebuilds of it), Fedora 44+, other Ubuntu/Debian releases, the **firewall
+> step** (`--skip-firewall` was used), and **SELinux in enforcing mode**
+> (containers can't exercise either). Try those on a disposable VM first.
 
 ## Usage
 

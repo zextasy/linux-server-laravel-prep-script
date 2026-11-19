@@ -195,6 +195,11 @@ setup_repos_dnf() {
       pkg_install "https://dl.fedoraproject.org/pub/epel/epel-release-latest-${OS_MAJOR}.noarch.rpm" || warn "could not install EPEL"
       have subscription-manager && subscription-manager repos --enable "codeready-builder-for-rhel-${OS_MAJOR}-${arch}-rpms" \
         || warn "could not enable CodeReady Builder repo (is the system registered?)"
+    elif [[ "$OS_ID" == "ol" ]]; then
+      # Oracle Linux has its own EPEL package and CodeReady Builder repo id.
+      pkg_install "oracle-epel-release-el${OS_MAJOR}" || warn "could not install EPEL"
+      pkg_install dnf-plugins-core
+      dnf config-manager --set-enabled "ol${OS_MAJOR}_codeready_builder" || warn "could not enable CodeReady Builder repo"
     else
       pkg_install epel-release || warn "could not install EPEL"
       pkg_install dnf-plugins-core
