@@ -7,6 +7,7 @@
 # scheduler cron entry and queue-worker definition, all named after the app.
 #
 #   cd /var/www/myapp && sudo laravel-app --domain example.com
+#   cd /var/www/myapp && sudo laravel-app --remove          # undo it again
 #
 # laravel-prep.sh installs this script as /usr/local/sbin/laravel-app.
 
@@ -34,6 +35,9 @@ SETUP_WORKER=1
 START_WORKER=0
 UPDATE_ENV=0
 FORCE=0
+REMOVE=0
+DROP_DB=0
+ASSUME_YES=0
 
 usage() {
   cat <<EOF
@@ -50,6 +54,11 @@ Usage: cd /path/to/laravel-app && sudo $(basename "$0") [options]
   --no-worker         Skip the Supervisor queue-worker definition
   --start-worker      Start the queue worker now (default: defined but not started)
   --force             Proceed even if no artisan file is found
+  --remove            Undo the setup of this app: removes its Nginx vhost, cron entry and
+                      queue worker. The app's files and its database are kept.
+  --drop-db           With --remove: also DROP the app's database and role and delete the
+                      saved credentials (asks you to type the database name, or pass --yes)
+  --yes               Skip the --drop-db confirmation prompt
   -h, --help          Show this help
 
 Group ownership of the app directory is changed to the web server's group, world
@@ -70,12 +79,16 @@ while [[ $# -gt 0 ]]; do
     --no-worker)     SETUP_WORKER=0; shift ;;
     --start-worker)  START_WORKER=1; shift ;;
     --force)         FORCE=1; shift ;;
+    --remove)        REMOVE=1; shift ;;
+    --drop-db)       DROP_DB=1; shift ;;
+    --yes|-y)        ASSUME_YES=1; shift ;;
     -h|--help)       usage; exit 0 ;;
     *) echo "Unknown option: $1" >&2; usage >&2; exit 1 ;;
   esac
 done
 
 [[ $EUID -eq 0 ]] || die "Run as root (e.g. sudo $(basename "$0"))"
+[[ "$DROP_DB" -eq 0 || "$REMOVE" -eq 1 ]] || die "--drop-db only makes sense together with --remove"
 
 # --------------------------------------------------------------------------
 # Server settings recorded by laravel-prep.sh
@@ -88,29 +101,33 @@ done
 # --------------------------------------------------------------------------
 # Resolve and validate the app
 # --------------------------------------------------------------------------
-APP_DIR="$(realpath "${APP_PATH:-$PWD}")"
-[[ -d "$APP_DIR" ]] || die "Not a directory: $APP_DIR"
-[[ "$APP_DIR" != "/" ]] || die "Refusing to use / as the app directory"
-# The path ends up in Nginx, cron and Supervisor files, so keep it plain.
-[[ "$APP_DIR" =~ ^/[A-Za-z0-9._/-]+$ ]] || die "App path may only contain letters, digits and . _ / - (got: $APP_DIR)"
+APP_DIR="$(realpath -m "${APP_PATH:-$PWD}")"
+if [[ "$REMOVE" -eq 0 ]]; then
+  [[ -d "$APP_DIR" ]] || die "Not a directory: $APP_DIR"
+  [[ "$APP_DIR" != "/" ]] || die "Refusing to use / as the app directory"
+  # The path ends up in Nginx, cron and Supervisor files, so keep it plain.
+  [[ "$APP_DIR" =~ ^/[A-Za-z0-9._/-]+$ ]] || die "App path may only contain letters, digits and . _ / - (got: $APP_DIR)"
 
-if [[ ! -f "$APP_DIR/artisan" || ! -d "$APP_DIR/public" ]]; then
-  [[ "$FORCE" -eq 1 ]] || die "$APP_DIR doesn't look like a Laravel app (no artisan or public/). Run from the app directory, or use --force."
-  warn "No artisan/public found in $APP_DIR; continuing because of --force"
+  if [[ ! -f "$APP_DIR/artisan" || ! -d "$APP_DIR/public" ]]; then
+    [[ "$FORCE" -eq 1 ]] || die "$APP_DIR doesn't look like a Laravel app (no artisan or public/). Run from the app directory, or use --force."
+    warn "No artisan/public found in $APP_DIR; continuing because of --force"
+  fi
 fi
 
+NAME_GIVEN="$APP_NAME"
 if [[ -z "$APP_NAME" ]]; then
   APP_NAME="$(basename "$APP_DIR" | tr '[:upper:]' '[:lower:]' | sed -E 's/[^a-z0-9_]+/_/g; s/^_+|_+$//g')"
   [[ "$APP_NAME" =~ ^[a-z] ]] || APP_NAME="app_${APP_NAME}"
 fi
 [[ "$APP_NAME" =~ ^[a-z][a-z0-9_]{0,39}$ ]] || die "--name must match ^[a-z][a-z0-9_]{0,39}\$ (got: $APP_NAME)"
 [[ "$DOMAIN" =~ ^[A-Za-z0-9._-]+$ ]]        || die "Invalid --domain: $DOMAIN"
+DB_NAME_GIVEN="$DB_NAME"; DB_USER_GIVEN="$DB_USER"
 DB_NAME="${DB_NAME:-$APP_NAME}"
 DB_USER="${DB_USER:-$APP_NAME}"
 [[ "$DB_NAME" =~ ^[a-z_][a-z0-9_]{0,62}$ ]] || die "--db-name must match ^[a-z_][a-z0-9_]*$"
 [[ "$DB_USER" =~ ^[a-z_][a-z0-9_]{0,62}$ ]] || die "--db-user must match ^[a-z_][a-z0-9_]*$"
 
-log "Setting up '${APP_NAME}' in ${APP_DIR}"
+[[ "$REMOVE" -eq 1 ]] || log "Setting up '${APP_NAME}' in ${APP_DIR}"
 
 # --------------------------------------------------------------------------
 # Permissions: web group can read the app and write storage/ + bootstrap/cache
@@ -340,8 +357,111 @@ EOF
 }
 
 # --------------------------------------------------------------------------
+# Remove: undo what this script set up for one app (never touches the app's code)
+# --------------------------------------------------------------------------
+remove_app() {
+  local conf="/etc/nginx/conf.d/${APP_NAME}.conf"
+  local cron="/etc/cron.d/laravel-${APP_NAME}"
+  local sup="${SUPERVISOR_CONF_DIR:-/nonexistent}/${APP_NAME}-worker.${SUPERVISOR_CONF_EXT:-conf}"
+  local cred_file="/root/.laravel-prep/${APP_NAME}.env"
+  local found=0 dir_known=0
+  # The app directory is trustworthy if it came from --path, from the current directory
+  # (no --name given), or from the vhost; with only --name and no vhost it is just $PWD.
+  [[ -n "$APP_PATH" || -z "$NAME_GIVEN" ]] && dir_known=1
+
+  # Prefer the names the app was actually created with over the defaults.
+  if [[ "$DROP_DB" -eq 1 && -r "$cred_file" ]]; then
+    local n u
+    n="$(sed -n 's/^DB_DATABASE=//p' "$cred_file")"; u="$(sed -n 's/^DB_USERNAME=//p' "$cred_file")"
+    [[ -z "$DB_NAME_GIVEN" && "$n" =~ ^[a-z_][a-z0-9_]{0,62}$ ]] && DB_NAME="$n"
+    [[ -z "$DB_USER_GIVEN" && "$u" =~ ^[a-z_][a-z0-9_]{0,62}$ ]] && DB_USER="$u"
+  fi
+
+  # Confirm before anything is touched, so declining leaves everything intact.
+  if [[ "$DROP_DB" -eq 1 ]]; then
+    case "$DB_NAME" in postgres|template0|template1) die "Refusing to drop the '${DB_NAME}' database" ;; esac
+    [[ "$DB_USER" != "postgres" ]] || die "Refusing to drop the 'postgres' role"
+    if [[ "$ASSUME_YES" -ne 1 ]]; then
+      [[ -t 0 ]] || die "--drop-db needs --yes when not run from a terminal"
+      local ans
+      read -r -p "This permanently deletes database '${DB_NAME}' and role '${DB_USER}'. Type the database name to confirm: " ans
+      [[ "$ans" == "$DB_NAME" ]] || die "Confirmation did not match; nothing was removed"
+    fi
+  fi
+
+  log "Removing '${APP_NAME}'"
+
+  # Recover the app directory from the vhost (needed for the SELinux rules).
+  if [[ -f "$conf" ]]; then
+    local root
+    root="$(awk '$1=="root"{gsub(";","",$2); print $2; exit}' "$conf")"
+    if [[ "${root%/public}" =~ ^/[A-Za-z0-9._/-]+$ ]]; then APP_DIR="${root%/public}"; dir_known=1; fi
+  fi
+
+  if [[ -f "$sup" ]]; then
+    found=1
+    if have supervisorctl; then
+      supervisorctl stop "${APP_NAME}-worker" >/dev/null 2>&1 || true
+    fi
+    rm -f "$sup"
+    if have supervisorctl; then
+      { supervisorctl reread && supervisorctl update; } >/dev/null 2>&1 || warn "supervisorctl could not reload its config"
+    fi
+    echo "Removed queue worker"
+  fi
+
+  if [[ -f "$cron" ]]; then
+    found=1; rm -f "$cron"; echo "Removed $cron"
+  fi
+
+  if [[ -f "$conf" ]]; then
+    found=1; rm -f "$conf"; echo "Removed $conf"
+    if nginx -t >/dev/null 2>&1; then
+      systemctl reload nginx
+    else
+      warn "nginx config test fails for a reason unrelated to this app; not reloading. Run: nginx -t"
+    fi
+  fi
+
+  # SELinux: drop the file-context rules added for this app (the labels on disk are left as they are).
+  if [[ "$dir_known" -eq 1 && "$APP_DIR" =~ ^/[A-Za-z0-9._/-]+$ && "$APP_DIR" != "/" ]] \
+     && have getenforce && [[ "$(getenforce)" != "Disabled" ]] && have semanage; then
+    local pat
+    for pat in "${APP_DIR}(/.*)?" "${APP_DIR}/storage(/.*)?" "${APP_DIR}/bootstrap/cache(/.*)?"; do
+      semanage fcontext -d "$pat" 2>/dev/null || true
+    done
+    [[ -d "$APP_DIR" ]] && { restorecon -R "$APP_DIR" || true; }
+  fi
+
+  if [[ "$DROP_DB" -eq 1 ]]; then
+    have psql || die "PostgreSQL client not found"
+    log "Dropping database '${DB_NAME}' and role '${DB_USER}'"
+    psql_admin -c "DROP DATABASE IF EXISTS ${DB_NAME} WITH (FORCE)" >/dev/null \
+      || warn "could not drop database ${DB_NAME}"
+    psql_admin -c "DROP ROLE IF EXISTS ${DB_USER}" >/dev/null \
+      || warn "could not drop role ${DB_USER} (does it own other objects?)"
+    rm -f "$cred_file"
+    found=1
+  fi
+
+  [[ "$found" -eq 1 ]] || die "Nothing found to remove for '${APP_NAME}'. Check the name (see /etc/nginx/conf.d/) or pass --name."
+
+  log "Done"
+  cat <<EOF
+
+  Removed    : vhost, scheduler and queue worker for '${APP_NAME}'$([[ "$DROP_DB" -eq 1 ]] && echo ", database ${DB_NAME} and role ${DB_USER}")
+  Kept       : the app's files$([[ "$DROP_DB" -eq 0 ]] && echo ", its PostgreSQL database/role and /root/.laravel-prep/${APP_NAME}.env (use --drop-db to delete them)"), /var/log/${APP_NAME}-worker.log, and the group/permission changes
+EOF
+}
+
+# --------------------------------------------------------------------------
 # Run
 # --------------------------------------------------------------------------
+if [[ "$REMOVE" -eq 1 ]]; then
+  remove_app
+  exit 0
+fi
+
 setup_permissions
 setup_selinux
 if [[ "$SETUP_DB" -eq 1 ]]; then

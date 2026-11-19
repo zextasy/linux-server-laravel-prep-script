@@ -52,7 +52,8 @@ derivatives such as Mint. Containers without systemd also won't work.
 > second run) in systemd containers on each distro below, each serving a PHP page
 > through Nginx + PHP-FPM. The split into two scripts was then re-verified with
 > two apps on a single server on **Ubuntu 24.04** and **Rocky Linux 9** (each app
-> served its own page and logged in to its own database); the other distros were
+> served its own page and logged in to its own database). `--remove` (with and
+> without `--drop-db`) was tested on Ubuntu 24.04 only; the other distros were
 > tested with the earlier single-script version, whose server part is unchanged
 > apart from the app/database steps moving to `laravel-app`.
 >
@@ -122,10 +123,41 @@ cd /var/www/shop && sudo laravel-app --domain shop.example.com --update-env
 | `--no-worker` | | Skip the queue-worker definition |
 | `--start-worker` | | Start the queue worker now |
 | `--force` | | Continue even if there is no `artisan` file |
+| `--remove` | | Undo the setup of this app (see below) |
+| `--drop-db` | | With `--remove`: also delete the app's database and role |
+| `--yes` | | Skip the `--drop-db` confirmation prompt |
 
 `laravel-app` is safe to re-run: an existing role keeps its password and an
 existing vhost is never overwritten (delete `/etc/nginx/conf.d/<app>.conf` and
 re-run to regenerate it). If Nginx rejects a new vhost, it is removed again.
+
+### 3. Remove an app
+
+```bash
+cd /var/www/shop && sudo laravel-app --remove
+```
+
+This removes the app's Nginx vhost, cron entry and Supervisor queue worker (the
+worker is stopped first), then reloads Nginx and Supervisor. Other apps are
+untouched. It **keeps** the app's files, its PostgreSQL database and role, and
+`/root/.laravel-prep/<app>.env`, so removing is reversible: run `laravel-app`
+again to put it back.
+
+To delete the database too, add `--drop-db`. You are asked to type the database
+name to confirm (nothing is changed if it doesn't match), or pass `--yes` for
+scripts. The names used come from the saved credentials file, so a custom
+`--db-name`/`--db-user` is found automatically.
+
+If the app's directory is already gone, name it instead:
+
+```bash
+sudo laravel-app --remove --name shop --drop-db --yes
+```
+
+What `--remove` does not do: delete the app's code, revert the group and
+permission changes, or delete `/var/log/<app>-worker.log`. Once an app is
+removed, requests for its old hostname fall through to Nginx's default vhost
+(the first one in `/etc/nginx/conf.d/`).
 
 ## After `laravel-app` runs
 
