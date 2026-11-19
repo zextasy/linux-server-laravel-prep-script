@@ -64,7 +64,7 @@ derivatives such as Mint. Containers without systemd also won't work.
 > | Rocky Linux 9 | 13 | |
 > | AlmaLinux 8 | 16 | uses the `postgresql:16` module stream |
 > | AlmaLinux 9 | 13 | |
-> | Oracle Linux 9 | 13 | uses `oracle-epel-release` |
+> | Oracle Linux 9 | 13 | uses `oracle-epel-release`; x86_64 tested, aarch64 only dependency-resolved (see notes) |
 > | CentOS Stream 9 | 13 | |
 > | CentOS Stream 10 | 16 | Valkey instead of Redis |
 > | Fedora 43 | 18 | dnf5 |
@@ -217,6 +217,12 @@ restore the permissions.
   available as `php` (symlinked to `php84` or similar), FPM listens on
   `127.0.0.1:9000`, and its config lives under `/etc/opt/remi/phpXY/`. All apps
   share one FPM pool.
+- **Oracle Linux** uses `oracle-epel-release-elN` and enables its
+  `olN_developer_EPEL` and `olN_codeready_builder` repos explicitly. PHP's `gd`
+  extension needs libraries from them (`libavif`, `libraqm`, ...), so if PHP
+  fails to install with a `libgd.so` dependency error, check `dnf repolist`
+  shows both. On other RHEL-family distros the same symptom means EPEL or CRB
+  is disabled.
 - **RHEL proper** needs an active subscription for the CodeReady Builder repo;
   the script warns and continues if that can't be enabled.
 - **Nginx reloads are asynchronous:** a new vhost can take a second or two to
