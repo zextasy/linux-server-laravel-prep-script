@@ -7,6 +7,7 @@
 # scheduler cron entry and queue-worker definition, all named after the app.
 #
 #   cd /var/www/myapp && sudo laravel-app --domain example.com
+#   sudo laravel-app --clone git@github.com:acme/shop.git --domain shop.example.com
 #   cd /var/www/myapp && sudo laravel-app --remove          # undo it again
 #
 # laravel-prep.sh installs this script as /usr/local/sbin/laravel-app.
@@ -39,6 +40,9 @@ START_WORKER=0
 UPDATE_ENV=0
 FORCE=0
 DEPLOY_KEY=0
+CLONE_URL=""
+CLONE_BRANCH=""
+CODE_USER=""
 REMOVE=0
 DROP_DB=0
 ASSUME_YES=0
@@ -46,6 +50,7 @@ ASSUME_YES=0
 usage() {
   cat <<EOF
 Usage: cd /path/to/laravel-app && sudo $(basename "$0") [options]
+   or: sudo $(basename "$0") --clone git@host:owner/repo.git [options]    (private repo over SSH)
 
   --domain DOMAIN     Nginx server_name              (default: catch-all; only one app may use it)
   --name NAME         App name for vhost/DB/cron     (default: derived from the directory name)
@@ -57,6 +62,12 @@ Usage: cd /path/to/laravel-app && sudo $(basename "$0") [options]
   --no-scheduler      Skip the schedule:run cron entry
   --no-worker         Skip the Supervisor queue-worker definition
   --start-worker      Start the queue worker now (default: defined but not started)
+  --clone URL         Clone a (private) repo over SSH first, then set it up. Creates an SSH deploy key,
+                      prints the public key and waits until the git host accepts it. The app goes to
+                      /var/www/<repo> unless --path is given.
+  --branch BRANCH     With --clone: branch or tag to check out (default: the repo's default branch)
+  --user USER         With --clone: Unix user that owns the code (default: the user who ran sudo;
+                      created if missing)
   --deploy-key        Create an SSH deploy key for the app's owner (to pull a private repo) and
                       point this app's git repo at it; prints the public key to add on GitHub/GitLab
   --force             Proceed even if no artisan file is found
@@ -85,6 +96,9 @@ while [[ $# -gt 0 ]]; do
     --no-worker)     SETUP_WORKER=0; shift ;;
     --start-worker)  START_WORKER=1; shift ;;
     --deploy-key)    DEPLOY_KEY=1; shift ;;
+    --clone)         CLONE_URL="${2:?}"; shift 2 ;;
+    --branch)        CLONE_BRANCH="${2:?}"; shift 2 ;;
+    --user)          CODE_USER="${2:?}"; shift 2 ;;
     --force)         FORCE=1; shift ;;
     --remove)        REMOVE=1; shift ;;
     --drop-db)       DROP_DB=1; shift ;;
@@ -97,6 +111,16 @@ done
 [[ $EUID -eq 0 ]] || die "Run as root (e.g. sudo $(basename "$0"))"
 [[ "$DEPLOY_KEY" -eq 0 || "$REMOVE" -eq 0 ]] || die "--deploy-key can't be combined with --remove (removing an app deletes its deploy key)"
 [[ "$DROP_DB" -eq 0 || "$REMOVE" -eq 1 ]] || die "--drop-db only makes sense together with --remove"
+[[ -z "$CLONE_URL" || "$REMOVE" -eq 0 ]] || die "--clone can't be combined with --remove"
+if [[ -n "$CLONE_URL" ]]; then
+  # SSH URLs only: a private repo over HTTPS would need a token, which this script does not store.
+  [[ "$CLONE_URL" =~ ^(git@[A-Za-z0-9.-]+:[A-Za-z0-9._/-]+|ssh://git@[A-Za-z0-9.-]+(:[0-9]+)?/[A-Za-z0-9._/-]+)$ ]] \
+    || die "--clone needs an SSH URL like git@github.com:owner/repo.git (got: $CLONE_URL)"
+  [[ -z "$CLONE_BRANCH" || "$CLONE_BRANCH" =~ ^[A-Za-z0-9._/-]+$ ]] || die "Invalid --branch: $CLONE_BRANCH"
+  [[ -z "$CODE_USER" || "$CODE_USER" =~ ^[a-z_][a-z0-9_-]*$ ]] || die "Invalid --user: $CODE_USER"
+elif [[ -n "$CLONE_BRANCH" || -n "$CODE_USER" ]]; then
+  die "--branch and --user only apply together with --clone"
+fi
 
 # --------------------------------------------------------------------------
 # Server settings recorded by laravel-prep.sh
@@ -109,8 +133,14 @@ done
 # --------------------------------------------------------------------------
 # Resolve and validate the app
 # --------------------------------------------------------------------------
+if [[ -n "$CLONE_URL" && -z "$APP_PATH" ]]; then
+  _repo="$(basename "${CLONE_URL%.git}")"
+  APP_PATH="/var/www/${_repo}"
+fi
 APP_DIR="$(realpath -m "${APP_PATH:-$PWD}")"
-if [[ "$REMOVE" -eq 0 ]]; then
+
+# Checks that the app directory is usable. Runs now normally, or after the clone with --clone.
+validate_app_dir() {
   [[ -d "$APP_DIR" ]] || die "Not a directory: $APP_DIR"
   [[ "$APP_DIR" != "/" ]] || die "Refusing to use / as the app directory"
   # The path ends up in Nginx, cron and Supervisor files, so keep it plain.
@@ -120,7 +150,8 @@ if [[ "$REMOVE" -eq 0 ]]; then
     [[ "$FORCE" -eq 1 ]] || die "$APP_DIR doesn't look like a Laravel app (no artisan or public/). Run from the app directory, or use --force."
     warn "No artisan/public found in $APP_DIR; continuing because of --force"
   fi
-fi
+}
+[[ "$REMOVE" -eq 1 || -n "$CLONE_URL" ]] || validate_app_dir
 
 NAME_GIVEN="$APP_NAME"
 if [[ -z "$APP_NAME" ]]; then
@@ -240,7 +271,12 @@ set_env_key() {
 
 update_env_file() {
   local env="$APP_DIR/.env"
-  [[ -f "$env" ]] || { warn "--update-env: $env not found; copy .env.example to .env first"; return 0; }
+  if [[ ! -f "$env" && -f "$APP_DIR/.env.example" ]]; then
+    # A fresh clone has no .env: start from the example, owned by the app's owner.
+    install -m 640 -o "$(stat -c %U "$APP_DIR")" -g "$WEB_GROUP" "$APP_DIR/.env.example" "$env"
+    echo "Created $env from .env.example"
+  fi
+  [[ -f "$env" ]] || { warn "--update-env: $env not found and there is no .env.example"; return 0; }
   [[ -n "$DB_PASSWORD_NEW" ]] || { warn "--update-env: role already existed, so its password is unknown; .env left alone"; return 0; }
   set_env_key "$env" DB_CONNECTION pgsql
   set_env_key "$env" DB_HOST 127.0.0.1
@@ -368,9 +404,12 @@ EOF
 # Git deploy key: one SSH key per app, owned by the user who owns the app files
 # --------------------------------------------------------------------------
 DEPLOY_KEY_PATH=""
-setup_deploy_key() {
-  log "Setting up a git deploy key"
-  local owner home key ssh_cmd
+DEPLOY_SSH_CMD=""
+DEPLOY_OWNER=""
+
+# Create (or reuse) the app's key in the owner's ~/.ssh. Sets DEPLOY_KEY_PATH/DEPLOY_SSH_CMD/DEPLOY_OWNER.
+deploy_key_create() {
+  local owner home key
   owner="$(stat -c %U "$APP_DIR")"
   home="$(getent passwd "$owner" | cut -d: -f6)"
   [[ -n "$home" && -d "$home" ]] || die "Cannot find a home directory for '${owner}' (the owner of ${APP_DIR})"
@@ -391,26 +430,87 @@ setup_deploy_key() {
     runuser -u "$owner" -- ssh-keygen -q -t ed25519 -N "" -C "${APP_NAME}-deploy@$(hostname)" -f "$key"
   fi
   chmod 600 "$key"
+  DEPLOY_OWNER="$owner"
   DEPLOY_KEY_PATH="$key"
+  DEPLOY_SSH_CMD="ssh -i ${key} -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new"
+}
 
-  ssh_cmd="ssh -i ${key} -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new"
-  if [[ -d "$APP_DIR/.git" ]]; then
-    runuser -u "$owner" -- git -C "$APP_DIR" config --local core.sshCommand "$ssh_cmd"
-    echo "Configured ${APP_DIR} to use this key for git over SSH"
-  else
-    echo "${APP_DIR} is not a git repository, so no repo was configured. Once it is a checkout, re-run"
-    echo "laravel-app --deploy-key here. To clone a private repo with this key before then:"
-    echo "  sudo -u ${owner} env GIT_SSH_COMMAND='${ssh_cmd}' git clone git@github.com:OWNER/REPO.git <dir>"
-  fi
-
+deploy_key_print() {
   cat <<EOF
 
   Add this public key as a read-only DEPLOY KEY on your git host
   (GitHub: repo > Settings > Deploy keys; GitLab: repo > Settings > Repository > Deploy keys):
 
-$(cat "${key}.pub")
+$(cat "${DEPLOY_KEY_PATH}.pub")
 
 EOF
+}
+
+# Point the app's git repo at its key (only possible once it is a checkout).
+deploy_key_configure_repo() {
+  runuser -u "$DEPLOY_OWNER" -- git -C "$APP_DIR" config --local core.sshCommand "$DEPLOY_SSH_CMD"
+  echo "Configured ${APP_DIR} to use this key for git over SSH"
+}
+
+setup_deploy_key() {
+  log "Setting up a git deploy key"
+  deploy_key_create
+  if [[ -d "$APP_DIR/.git" ]]; then
+    deploy_key_configure_repo
+  else
+    echo "${APP_DIR} is not a git repository, so no repo was configured. Once it is a checkout, re-run"
+    echo "laravel-app --deploy-key here, or use: laravel-app --clone git@host:owner/repo.git"
+  fi
+  deploy_key_print
+}
+
+# --------------------------------------------------------------------------
+# Clone a private repo over SSH with a per-app deploy key
+# --------------------------------------------------------------------------
+clone_repo() {
+  local owner="$CODE_USER"
+  if [[ -z "$owner" ]]; then
+    owner="${SUDO_USER:-}"
+    [[ -n "$owner" && "$owner" != "root" ]] || die "Run through sudo from your own account, or pass --user NAME to say who should own the code"
+  fi
+  log "Cloning ${CLONE_URL} into ${APP_DIR} (owner: ${owner})"
+
+  if ! id "$owner" >/dev/null 2>&1; then
+    useradd -m -s /bin/bash "$owner"
+    echo "Created user '${owner}'"
+  fi
+
+  local already_repo=0
+  if [[ -d "$APP_DIR/.git" ]]; then
+    already_repo=1
+    echo "${APP_DIR} is already a git checkout; skipping the clone"
+  elif [[ -e "$APP_DIR" && -n "$(ls -A "$APP_DIR" 2>/dev/null)" ]]; then
+    die "${APP_DIR} exists and is not empty. Pass --path to clone somewhere else."
+  fi
+  mkdir -p "$APP_DIR"
+  [[ "$already_repo" -eq 1 ]] || chown "${owner}:$(id -gn "$owner")" "$APP_DIR"
+
+  deploy_key_create
+  [[ "$DEPLOY_OWNER" == "$owner" ]] || warn "${APP_DIR} is owned by '${DEPLOY_OWNER}', not '${owner}'; using ${DEPLOY_OWNER}'s key and account"
+  deploy_key_print
+
+  if [[ "$already_repo" -eq 0 ]]; then
+    # Wait until the git host accepts the key.
+    local err
+    until err="$(runuser -u "$DEPLOY_OWNER" -- env GIT_TERMINAL_PROMPT=0 GIT_SSH_COMMAND="${DEPLOY_SSH_CMD} -o BatchMode=yes" \
+                  timeout 60 git ls-remote "$CLONE_URL" 2>&1 >/dev/null)"; do
+      echo "Cannot read ${CLONE_URL} yet: $(printf '%s' "$err" | tail -n 2 | tr '\n' ' ')"
+      [[ -t 0 ]] || die "Add the deploy key above on your git host, then re-run the same command (the key is kept)."
+      read -r -p "Add the key above on your git host, then press Enter to retry (Ctrl-C to abort)... " _
+    done
+    echo "Access OK"
+
+    local branch_args=()
+    [[ -z "$CLONE_BRANCH" ]] || branch_args=(--branch "$CLONE_BRANCH")
+    runuser -u "$DEPLOY_OWNER" -- env GIT_TERMINAL_PROMPT=0 GIT_SSH_COMMAND="${DEPLOY_SSH_CMD}" \
+      git clone "${branch_args[@]}" "$CLONE_URL" "$APP_DIR"
+  fi
+  deploy_key_configure_repo
 }
 
 # --------------------------------------------------------------------------
@@ -525,6 +625,11 @@ EOF
 if [[ "$REMOVE" -eq 1 ]]; then
   remove_app
   exit 0
+fi
+
+if [[ -n "$CLONE_URL" ]]; then
+  clone_repo
+  validate_app_dir
 fi
 
 setup_permissions

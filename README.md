@@ -122,6 +122,9 @@ cd /var/www/shop && sudo laravel-app --domain shop.example.com --update-env
 | `--no-scheduler` | | Skip the cron entry |
 | `--no-worker` | | Skip the queue-worker definition |
 | `--start-worker` | | Start the queue worker now |
+| `--clone URL` | | Clone a private repo over SSH with a per-app deploy key, then set it up (see below) |
+| `--branch BRANCH` | | With `--clone`: branch or tag to check out |
+| `--user USER` | the user who ran `sudo` | With `--clone`: Unix user that owns the code (created if missing) |
 | `--deploy-key` | | Create an SSH deploy key for the app's owner and point the app's git repo at it (see below) |
 | `--force` | | Continue even if there is no `artisan` file |
 | `--remove` | | Undo the setup of this app (see below) |
@@ -132,7 +135,41 @@ cd /var/www/shop && sudo laravel-app --domain shop.example.com --update-env
 existing vhost is never overwritten (delete `/etc/nginx/conf.d/<app>.conf` and
 re-run to regenerate it). If Nginx rejects a new vhost, it is removed again.
 
-### Pulling a private repository (deploy key)
+### Cloning a private repository and setting it up
+
+Instead of cloning by hand, let `laravel-app` do both:
+
+```bash
+sudo laravel-app --clone git@github.com:acme/shop.git --domain shop.example.com --update-env
+```
+
+What happens:
+
+1. The code goes to `/var/www/<repo>` (override with `--path`), owned by the user who
+   ran `sudo` (override with `--user`).
+2. An SSH deploy key is created for that user, and its **public key is printed**.
+3. Add it as a **read-only deploy key** on the repo (GitHub: repo, Settings, Deploy keys;
+   GitLab: repo, Settings, Repository, Deploy keys). In a terminal the script waits and
+   retries when you press Enter. Without a terminal (scripts, CI) it stops and tells you
+   to re-run the same command once the key is added; the key is kept.
+4. It clones (`--branch` to pick a branch or tag), points the checkout at its key so a
+   later `git pull` works with plain `git`, and then runs the normal app setup. With
+   `--update-env`, a fresh clone's `.env` is created from `.env.example` first.
+
+Run it once per repository; each repo gets its own key, because GitHub requires a
+unique deploy key per repository:
+
+```bash
+sudo laravel-app --clone git@github.com:acme/shop.git --domain shop.example.com
+sudo laravel-app --clone git@github.com:acme/blog.git --domain blog.example.com --branch release
+```
+
+Only SSH URLs are accepted (`git@host:owner/repo.git` or `ssh://git@host/...`); a
+private repo over HTTPS would need a token, which these scripts don't store. Re-running
+with the same URL reuses the existing checkout and key. The clone doesn't run
+`composer install` or build assets; do that as the code's owner afterwards (see below).
+
+### Pulling a private repository you already cloned (deploy key)
 
 ```bash
 cd /var/www/shop && sudo laravel-app --deploy-key
