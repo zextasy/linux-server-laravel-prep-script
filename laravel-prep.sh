@@ -177,7 +177,12 @@ setup_repos_dnf() {
       # Oracle Linux has its own EPEL package and CodeReady Builder repo id.
       pkg_install "oracle-epel-release-el${OS_MAJOR}" || warn "could not install EPEL"
       pkg_install dnf-plugins-core
-      dnf config-manager --set-enabled "ol${OS_MAJOR}_codeready_builder" || warn "could not enable CodeReady Builder repo"
+      # Installing the package is not enough: the repos may be present but disabled, and
+      # PHP's gd extension needs libraries (libavif, libraqm, ...) from these two repos.
+      local r
+      for r in "ol${OS_MAJOR}_developer_EPEL" "ol${OS_MAJOR}_codeready_builder"; do
+        dnf config-manager --set-enabled "$r" || warn "could not enable the $r repo"
+      done
     else
       pkg_install epel-release || warn "could not install EPEL"
       pkg_install dnf-plugins-core
@@ -195,6 +200,10 @@ setup_repos_dnf() {
 # --------------------------------------------------------------------------
 install_php() {
   log "Installing PHP ${PHP_VERSION}"
+  if [[ "$PM" == dnf ]]; then
+    # Fail early with an explanation instead of a bare dependency error.
+    dnf_php_hint='PHP failed to install. On RHEL-family systems this usually means the EPEL and/or CodeReady Builder (CRB) repositories are not enabled (check: dnf repolist), or Remi has no build for this OS/architecture.'
+  fi
   if [[ "$PM" == apt ]]; then
     pkg_install "php${PHP_VERSION}-cli" "php${PHP_VERSION}-fpm" "php${PHP_VERSION}-pgsql" \
       "php${PHP_VERSION}-mbstring" "php${PHP_VERSION}-xml" "php${PHP_VERSION}-curl" \
@@ -204,7 +213,7 @@ install_php() {
   else
     local p="php${PHP_NODOT}-php"
     pkg_install "${p}-cli" "${p}-fpm" "${p}-pgsql" "${p}-mbstring" "${p}-xml" \
-      "${p}-bcmath" "${p}-intl" "${p}-gd" "${p}-common"
+      "${p}-bcmath" "${p}-intl" "${p}-gd" "${p}-common" || die "$dnf_php_hint"
     pkg_try "${p}-opcache" "${p}-pecl-zip" "${p}-pecl-redis6" "${p}-process"
     ln -sf "$PHP_BIN" /usr/local/bin/php
   fi
