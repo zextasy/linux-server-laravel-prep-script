@@ -14,6 +14,9 @@
 
 set -Eeuo pipefail
 trap 'echo "ERROR: line $LINENO: command failed: $BASH_COMMAND" >&2' ERR
+# sudo on RHEL-family systems resets PATH to one without /usr/local, where Composer,
+# Node.js and laravel-app are installed. Make sure this script can always find them.
+export PATH="/usr/local/sbin:/usr/local/bin:${PATH}"
 
 # --------------------------------------------------------------------------
 # Defaults (override with flags or environment variables)
@@ -356,6 +359,24 @@ configure_selinux() {
 }
 
 # --------------------------------------------------------------------------
+# sudo PATH (RHEL family): its secure_path lacks /usr/local, so `sudo laravel-app`,
+# `sudo -u deploy composer` and friends would say "command not found". Add a drop-in.
+# --------------------------------------------------------------------------
+fix_sudo_path() {
+  [[ "$PM" == dnf ]] || return 0      # Debian/Ubuntu already include /usr/local in secure_path
+  have visudo || return 0             # sudo not installed: nothing to fix
+  local tmp; tmp="$(mktemp)"
+  echo 'Defaults secure_path = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"' > "$tmp"
+  if visudo -cf "$tmp" >/dev/null 2>&1; then
+    install -m 0440 -o root -g root "$tmp" /etc/sudoers.d/laravel-prep-path
+    echo "Added /etc/sudoers.d/laravel-prep-path so sudo can find /usr/local/bin and /usr/local/sbin"
+  else
+    warn "could not validate the sudoers drop-in; sudo may not find laravel-app/composer/node (use their full /usr/local paths)"
+  fi
+  rm -f "$tmp"
+}
+
+# --------------------------------------------------------------------------
 # Hand-off to laravel-app: record what was detected, install the per-app script
 # --------------------------------------------------------------------------
 write_state() {
@@ -418,6 +439,7 @@ install_composer
 configure_selinux
 [[ "$SETUP_FIREWALL" -eq 1 ]] && setup_firewall
 write_state
+fix_sudo_path
 
 log "Done"
 
