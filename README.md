@@ -22,7 +22,7 @@ can host as many apps as you like on one server.
 | Web server | Nginx (no sites yet) |
 | Database | PostgreSQL (distro packages), listening on localhost |
 | Cache/queues | Redis (Valkey on EL10) |
-| Tooling | Composer (installer checksum verified), Node.js (tarball checksum verified), git, unzip, cron, Supervisor |
+| Tooling | Composer (installer checksum verified; an existing install is updated to the current stable release), Node.js (tarball checksum verified), git, unzip, cron, Supervisor |
 | Hardening | Firewall (ufw / firewalld) allowing SSH, 80 and 443; SELinux booleans on RHEL-family |
 
 **Per app (`laravel-app.sh`)**

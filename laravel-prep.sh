@@ -313,7 +313,18 @@ install_tools() {
 
 install_composer() {
   log "Installing Composer"
-  if have composer; then echo "Composer already installed"; return; fi
+  local existing; existing="$(command -v composer || true)"
+
+  # A Composer we installed earlier: bring it up to the current stable release.
+  # (--stable also moves an old 2.2 LTS install onto the normal release channel.)
+  if [[ "$existing" == /usr/local/bin/composer ]]; then
+    echo "Composer found ($(COMPOSER_ALLOW_SUPERUSER=1 composer --version 2>/dev/null | head -1)); updating"
+    COMPOSER_ALLOW_SUPERUSER=1 composer self-update --stable --no-interaction \
+      || warn "composer self-update failed; keeping the existing version"
+    return 0
+  fi
+  [[ -z "$existing" ]] || warn "found Composer at $existing (not managed by this script); installing a current copy in /usr/local/bin, which takes precedence"
+
   local tmp expected actual; tmp="$(mktemp -d)"
   expected="$(curl -fsSL https://composer.github.io/installer.sig)"
   curl -fsSL -o "$tmp/installer.php" https://getcomposer.org/installer
