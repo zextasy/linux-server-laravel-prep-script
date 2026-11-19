@@ -420,13 +420,21 @@ configure_selinux
 write_state
 
 log "Done"
+
+# Version lookups must never abort or print errors: a missing tool just shows "not found".
+v_php="$("$PHP_BIN" -r 'echo PHP_VERSION;' 2>/dev/null || echo 'not found')"
+v_nginx=""; have nginx && v_nginx="$(nginx -v 2>&1 | sed 's|.*/||' || true)"
+v_pg="$(psql --version 2>/dev/null | awk '{print $3}' || true)"
+v_composer="$(composer --version 2>/dev/null | awk '{print $3}' || true)"
+v_node="$(node -v 2>/dev/null || true)"
+
 cat <<EOF
 
-  PHP        : $("$PHP_BIN" -r 'echo PHP_VERSION;')
-  Nginx      : $(nginx -v 2>&1 | sed 's|.*/||')
-  PostgreSQL : $(psql --version 2>/dev/null | awk '{print $3}')
-  Composer   : $(composer --version 2>/dev/null | awk '{print $3}')
-  Node.js    : $(node -v 2>/dev/null || echo skipped)
+  PHP        : ${v_php}
+  Nginx      : ${v_nginx:-not found}
+  PostgreSQL : ${v_pg:-not found}
+  Composer   : ${v_composer:-not found}
+  Node.js    : ${v_node:-$([[ "$INSTALL_NODE" -eq 1 ]] && echo "not found" || echo skipped)}
 
   Next step  : cd into a Laravel app directory and run:  sudo laravel-app --domain example.com
 EOF
