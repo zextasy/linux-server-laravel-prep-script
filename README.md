@@ -22,7 +22,7 @@ can host as many apps as you like on one server.
 | Web server | Nginx (no sites yet) |
 | Database | PostgreSQL (distro packages), listening on localhost |
 | Cache/queues | Redis (Valkey on EL10) |
-| Tooling | Composer (installer checksum verified), Node.js (tarball checksum verified), git, unzip, cron, Supervisor |
+| Tooling | Composer (installer checksum verified; an existing install is updated to the current stable release), Node.js (tarball checksum verified), git, unzip, cron, Supervisor |
 | Hardening | Firewall (ufw / firewalld) allowing SSH, 80 and 443; SELinux booleans on RHEL-family |
 
 **Per app (`laravel-app.sh`)**
@@ -223,6 +223,12 @@ restore the permissions.
   fails to install with a `libgd.so` dependency error, check `dnf repolist`
   shows both. On other RHEL-family distros the same symptom means EPEL or CRB
   is disabled.
+- **`sudo` and `/usr/local` (RHEL-family):** `sudo` there uses a `secure_path` that
+  leaves out `/usr/local/bin` and `/usr/local/sbin`, where `composer`, `node` and
+  `laravel-app` live. `laravel-prep.sh` adds a validated drop-in,
+  `/etc/sudoers.d/laravel-prep-path`, so `sudo laravel-app` and
+  `sudo -u deploy composer ...` work. Both scripts also add those directories to
+  their own `PATH`. Debian/Ubuntu need nothing.
 - **RHEL proper** needs an active subscription for the CodeReady Builder repo;
   the script warns and continues if that can't be enabled.
 - **Nginx reloads are asynchronous:** a new vhost can take a second or two to

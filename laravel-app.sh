@@ -13,6 +13,9 @@
 
 set -Eeuo pipefail
 trap 'echo "ERROR: line $LINENO: command failed: $BASH_COMMAND" >&2' ERR
+# sudo on RHEL-family systems resets PATH to one without /usr/local, where Composer,
+# Node.js and laravel-app are installed. Make sure this script can always find them.
+export PATH="/usr/local/sbin:/usr/local/bin:${PATH}"
 
 STATE_FILE=/etc/laravel-prep/server.conf
 

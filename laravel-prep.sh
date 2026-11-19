@@ -14,6 +14,9 @@
 
 set -Eeuo pipefail
 trap 'echo "ERROR: line $LINENO: command failed: $BASH_COMMAND" >&2' ERR
+# sudo on RHEL-family systems resets PATH to one without /usr/local, where Composer,
+# Node.js and laravel-app are installed. Make sure this script can always find them.
+export PATH="/usr/local/sbin:/usr/local/bin:${PATH}"
 
 # --------------------------------------------------------------------------
 # Defaults (override with flags or environment variables)
@@ -310,7 +313,18 @@ install_tools() {
 
 install_composer() {
   log "Installing Composer"
-  if have composer; then echo "Composer already installed"; return; fi
+  local existing; existing="$(command -v composer || true)"
+
+  # A Composer we installed earlier: bring it up to the current stable release.
+  # (--stable also moves an old 2.2 LTS install onto the normal release channel.)
+  if [[ "$existing" == /usr/local/bin/composer ]]; then
+    echo "Composer found ($(COMPOSER_ALLOW_SUPERUSER=1 composer --version 2>/dev/null | head -1)); updating"
+    COMPOSER_ALLOW_SUPERUSER=1 composer self-update --stable --no-interaction \
+      || warn "composer self-update failed; keeping the existing version"
+    return 0
+  fi
+  [[ -z "$existing" ]] || warn "found Composer at $existing (not managed by this script); installing a current copy in /usr/local/bin, which takes precedence"
+
   local tmp expected actual; tmp="$(mktemp -d)"
   expected="$(curl -fsSL https://composer.github.io/installer.sig)"
   curl -fsSL -o "$tmp/installer.php" https://getcomposer.org/installer
@@ -353,6 +367,24 @@ configure_selinux() {
   pkg_try policycoreutils-python-utils
   setsebool -P httpd_can_network_connect 1 || warn "setsebool httpd_can_network_connect failed"
   setsebool -P httpd_can_network_connect_db 1 || warn "setsebool httpd_can_network_connect_db failed"
+}
+
+# --------------------------------------------------------------------------
+# sudo PATH (RHEL family): its secure_path lacks /usr/local, so `sudo laravel-app`,
+# `sudo -u deploy composer` and friends would say "command not found". Add a drop-in.
+# --------------------------------------------------------------------------
+fix_sudo_path() {
+  [[ "$PM" == dnf ]] || return 0      # Debian/Ubuntu already include /usr/local in secure_path
+  have visudo || return 0             # sudo not installed: nothing to fix
+  local tmp; tmp="$(mktemp)"
+  echo 'Defaults secure_path = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"' > "$tmp"
+  if visudo -cf "$tmp" >/dev/null 2>&1; then
+    install -m 0440 -o root -g root "$tmp" /etc/sudoers.d/laravel-prep-path
+    echo "Added /etc/sudoers.d/laravel-prep-path so sudo can find /usr/local/bin and /usr/local/sbin"
+  else
+    warn "could not validate the sudoers drop-in; sudo may not find laravel-app/composer/node (use their full /usr/local paths)"
+  fi
+  rm -f "$tmp"
 }
 
 # --------------------------------------------------------------------------
@@ -418,15 +450,24 @@ install_composer
 configure_selinux
 [[ "$SETUP_FIREWALL" -eq 1 ]] && setup_firewall
 write_state
+fix_sudo_path
 
 log "Done"
+
+# Version lookups must never abort or print errors: a missing tool just shows "not found".
+v_php="$("$PHP_BIN" -r 'echo PHP_VERSION;' 2>/dev/null || echo 'not found')"
+v_nginx=""; have nginx && v_nginx="$(nginx -v 2>&1 | sed 's|.*/||' || true)"
+v_pg="$(psql --version 2>/dev/null | awk '{print $3}' || true)"
+v_composer="$(composer --version 2>/dev/null | awk '{print $3}' || true)"
+v_node="$(node -v 2>/dev/null || true)"
+
 cat <<EOF
 
-  PHP        : $("$PHP_BIN" -r 'echo PHP_VERSION;')
-  Nginx      : $(nginx -v 2>&1 | sed 's|.*/||')
-  PostgreSQL : $(psql --version 2>/dev/null | awk '{print $3}')
-  Composer   : $(composer --version 2>/dev/null | awk '{print $3}')
-  Node.js    : $(node -v 2>/dev/null || echo skipped)
+  PHP        : ${v_php}
+  Nginx      : ${v_nginx:-not found}
+  PostgreSQL : ${v_pg:-not found}
+  Composer   : ${v_composer:-not found}
+  Node.js    : ${v_node:-$([[ "$INSTALL_NODE" -eq 1 ]] && echo "not found" || echo skipped)}
 
   Next step  : cd into a Laravel app directory and run:  sudo laravel-app --domain example.com
 EOF
