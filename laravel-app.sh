@@ -35,6 +35,7 @@ SETUP_WORKER=1
 START_WORKER=0
 UPDATE_ENV=0
 FORCE=0
+DEPLOY_KEY=0
 REMOVE=0
 DROP_DB=0
 ASSUME_YES=0
@@ -53,6 +54,8 @@ Usage: cd /path/to/laravel-app && sudo $(basename "$0") [options]
   --no-scheduler      Skip the schedule:run cron entry
   --no-worker         Skip the Supervisor queue-worker definition
   --start-worker      Start the queue worker now (default: defined but not started)
+  --deploy-key        Create an SSH deploy key for the app's owner (to pull a private repo) and
+                      point this app's git repo at it; prints the public key to add on GitHub/GitLab
   --force             Proceed even if no artisan file is found
   --remove            Undo the setup of this app: removes its Nginx vhost, cron entry and
                       queue worker. The app's files and its database are kept.
@@ -78,6 +81,7 @@ while [[ $# -gt 0 ]]; do
     --no-scheduler)  SETUP_SCHEDULER=0; shift ;;
     --no-worker)     SETUP_WORKER=0; shift ;;
     --start-worker)  START_WORKER=1; shift ;;
+    --deploy-key)    DEPLOY_KEY=1; shift ;;
     --force)         FORCE=1; shift ;;
     --remove)        REMOVE=1; shift ;;
     --drop-db)       DROP_DB=1; shift ;;
@@ -88,6 +92,7 @@ while [[ $# -gt 0 ]]; do
 done
 
 [[ $EUID -eq 0 ]] || die "Run as root (e.g. sudo $(basename "$0"))"
+[[ "$DEPLOY_KEY" -eq 0 || "$REMOVE" -eq 0 ]] || die "--deploy-key can't be combined with --remove (removing an app deletes its deploy key)"
 [[ "$DROP_DB" -eq 0 || "$REMOVE" -eq 1 ]] || die "--drop-db only makes sense together with --remove"
 
 # --------------------------------------------------------------------------
@@ -357,6 +362,55 @@ EOF
 }
 
 # --------------------------------------------------------------------------
+# Git deploy key: one SSH key per app, owned by the user who owns the app files
+# --------------------------------------------------------------------------
+DEPLOY_KEY_PATH=""
+setup_deploy_key() {
+  log "Setting up a git deploy key"
+  local owner home key ssh_cmd
+  owner="$(stat -c %U "$APP_DIR")"
+  home="$(getent passwd "$owner" | cut -d: -f6)"
+  [[ -n "$home" && -d "$home" ]] || die "Cannot find a home directory for '${owner}' (the owner of ${APP_DIR})"
+  [[ "$owner" != "root" ]] || warn "${APP_DIR} is owned by root, so the key will live in root's home. Consider chown-ing the app to a deploy user."
+
+  if ! have ssh-keygen; then
+    echo "Installing the OpenSSH client"
+    if [[ "${PM:-}" == "apt" ]]; then apt-get -o Acquire::Retries=5 install -y openssh-client
+    else dnf install -y --setopt=retries=5 openssh-clients; fi
+  fi
+
+  install -d -m 700 -o "$owner" -g "$(id -gn "$owner")" "$home/.ssh"
+  key="$home/.ssh/laravel_${APP_NAME}_deploy"
+  if [[ -f "$key" ]]; then
+    echo "Deploy key already exists: $key"
+  else
+    # No passphrase: pulls during deploys must run unattended.
+    runuser -u "$owner" -- ssh-keygen -q -t ed25519 -N "" -C "${APP_NAME}-deploy@$(hostname)" -f "$key"
+  fi
+  chmod 600 "$key"
+  DEPLOY_KEY_PATH="$key"
+
+  ssh_cmd="ssh -i ${key} -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new"
+  if [[ -d "$APP_DIR/.git" ]]; then
+    runuser -u "$owner" -- git -C "$APP_DIR" config --local core.sshCommand "$ssh_cmd"
+    echo "Configured ${APP_DIR} to use this key for git over SSH"
+  else
+    echo "${APP_DIR} is not a git repository, so no repo was configured. Once it is a checkout, re-run"
+    echo "laravel-app --deploy-key here. To clone a private repo with this key before then:"
+    echo "  sudo -u ${owner} env GIT_SSH_COMMAND='${ssh_cmd}' git clone git@github.com:OWNER/REPO.git <dir>"
+  fi
+
+  cat <<EOF
+
+  Add this public key as a read-only DEPLOY KEY on your git host
+  (GitHub: repo > Settings > Deploy keys; GitLab: repo > Settings > Repository > Deploy keys):
+
+$(cat "${key}.pub")
+
+EOF
+}
+
+# --------------------------------------------------------------------------
 # Remove: undo what this script set up for one app (never touches the app's code)
 # --------------------------------------------------------------------------
 remove_app() {
@@ -413,6 +467,14 @@ remove_app() {
   if [[ -f "$cron" ]]; then
     found=1; rm -f "$cron"; echo "Removed $cron"
   fi
+
+  # Deploy key created by --deploy-key (wherever the app's owner keeps it).
+  local k
+  for k in /root/.ssh/laravel_${APP_NAME}_deploy /home/*/.ssh/laravel_${APP_NAME}_deploy; do
+    if [[ -f "$k" ]]; then
+      found=1; rm -f "$k" "$k.pub"; echo "Removed deploy key $k (also revoke it on your git host)"
+    fi
+  done
 
   if [[ -f "$conf" ]]; then
     found=1; rm -f "$conf"; echo "Removed $conf"
@@ -471,6 +533,7 @@ fi
 setup_vhost
 [[ "$SETUP_SCHEDULER" -eq 1 ]] && setup_scheduler
 [[ "$SETUP_WORKER" -eq 1 ]] && setup_worker
+[[ "$DEPLOY_KEY" -eq 1 ]] && setup_deploy_key
 
 log "Done"
 cat <<EOF

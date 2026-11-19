@@ -122,6 +122,7 @@ cd /var/www/shop && sudo laravel-app --domain shop.example.com --update-env
 | `--no-scheduler` | | Skip the cron entry |
 | `--no-worker` | | Skip the queue-worker definition |
 | `--start-worker` | | Start the queue worker now |
+| `--deploy-key` | | Create an SSH deploy key for the app's owner and point the app's git repo at it (see below) |
 | `--force` | | Continue even if there is no `artisan` file |
 | `--remove` | | Undo the setup of this app (see below) |
 | `--drop-db` | | With `--remove`: also delete the app's database and role |
@@ -131,14 +132,32 @@ cd /var/www/shop && sudo laravel-app --domain shop.example.com --update-env
 existing vhost is never overwritten (delete `/etc/nginx/conf.d/<app>.conf` and
 re-run to regenerate it). If Nginx rejects a new vhost, it is removed again.
 
+### Pulling a private repository (deploy key)
+
+```bash
+cd /var/www/shop && sudo laravel-app --deploy-key
+```
+
+This creates an ed25519 key at `~/.ssh/laravel_<app>_deploy` for the user who
+owns the app's files, prints the public key, and (if the directory is a git
+checkout) sets `core.sshCommand` in that repo so `git pull` uses the key and no
+other. Add the printed public key as a **read-only deploy key** on GitHub or
+GitLab (repo settings, Deploy keys). GitHub requires a different key per
+repository, which is why the key is per app. Re-running keeps the same key.
+
+The key has no passphrase, so deploys can pull unattended; protect the server
+accordingly. If the directory isn't a git checkout yet, the script prints a
+`git clone` command that uses the key. `laravel-app --remove` deletes the key
+(revoke it on your git host too).
+
 ### 3. Remove an app
 
 ```bash
 cd /var/www/shop && sudo laravel-app --remove
 ```
 
-This removes the app's Nginx vhost, cron entry and Supervisor queue worker (the
-worker is stopped first), then reloads Nginx and Supervisor. Other apps are
+This removes the app's Nginx vhost, cron entry, deploy key and Supervisor queue
+worker (the worker is stopped first), then reloads Nginx and Supervisor. Other apps are
 untouched. It **keeps** the app's files, its PostgreSQL database and role, and
 `/root/.laravel-prep/<app>.env`, so removing is reversible: run `laravel-app`
 again to put it back.
