@@ -125,6 +125,7 @@ cd /var/www/shop && sudo laravel-app --domain shop.example.com --update-env
 | `--clone URL` | | Clone a private repo over SSH with a per-app deploy key, then set it up (see below) |
 | `--branch BRANCH` | | With `--clone`: branch or tag to check out |
 | `--user USER` | the user who ran `sudo` | With `--clone`: Unix user that owns the code (created if missing) |
+| `--install` | | Install dependencies as the code's owner: `composer install` and, if there is a `package.json`, `npm ci` + `npm run build` |
 | `--deploy-key` | | Create an SSH deploy key for the app's owner and point the app's git repo at it (see below) |
 | `--force` | | Continue even if there is no `artisan` file |
 | `--remove` | | Undo the setup of this app (see below) |
@@ -168,6 +169,30 @@ Only SSH URLs are accepted (`git@host:owner/repo.git` or `ssh://git@host/...`); 
 private repo over HTTPS would need a token, which these scripts don't store. Re-running
 with the same URL reuses the existing checkout and key. The clone doesn't run
 `composer install` or build assets; do that as the code's owner afterwards (see below).
+
+### Installing dependencies (`--install`)
+
+Add `--install` to install an app's dependencies in the same step, for example after a clone:
+
+```bash
+sudo laravel-app --clone git@github.com:acme/shop.git --domain shop.example.com --install --update-env
+# or, in an app that is already there:
+cd /var/www/shop && sudo laravel-app --install
+```
+
+It runs **as the user who owns the code**, never as root, before the permissions step so
+everything it creates gets the right group:
+
+- If there is a `composer.json`: `composer install --no-dev --optimize-autoloader`
+  (production mode: dev dependencies are skipped).
+- If there is a `package.json`: `npm ci` (or `npm install` when there is no
+  `package-lock.json`), then `npm run build` if `package.json` has a `build` script.
+  Dev dependencies are installed so the build tools (Vite, etc.) are available.
+
+If a step fails, the rest of the setup still completes and the script finishes with a
+warning and exit status 1. If npm isn't installed (for example you used `--no-node`),
+the npm part is skipped with a warning. `--install` doesn't run `php artisan` commands:
+after it you still need `key:generate`, `migrate --force`, and so on.
 
 ### Pulling a private repository you already cloned (deploy key)
 
@@ -219,7 +244,8 @@ removed, requests for its old hostname fall through to Nginx's default vhost
 
 1. **Database credentials** are in `/root/.laravel-prep/<app>.env` (or already
    in `.env` if you used `--update-env`).
-2. **Install and migrate** as the user who owns the code:
+2. **Install and migrate** as the user who owns the code (skip the first lines if you
+   used `--install`):
    ```bash
    composer install --no-dev --optimize-autoloader
    npm ci && npm run build

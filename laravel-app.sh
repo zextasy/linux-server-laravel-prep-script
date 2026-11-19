@@ -40,6 +40,8 @@ START_WORKER=0
 UPDATE_ENV=0
 FORCE=0
 DEPLOY_KEY=0
+INSTALL_DEPS=0
+INSTALL_FAILED=0
 CLONE_URL=""
 CLONE_BRANCH=""
 CODE_USER=""
@@ -68,6 +70,8 @@ Usage: cd /path/to/laravel-app && sudo $(basename "$0") [options]
   --branch BRANCH     With --clone: branch or tag to check out (default: the repo's default branch)
   --user USER         With --clone: Unix user that owns the code (default: the user who ran sudo;
                       created if missing)
+  --install           Install dependencies as the code's owner: composer install (--no-dev, optimized
+                      autoloader) and, if there is a package.json, npm ci/install and npm run build
   --deploy-key        Create an SSH deploy key for the app's owner (to pull a private repo) and
                       point this app's git repo at it; prints the public key to add on GitHub/GitLab
   --force             Proceed even if no artisan file is found
@@ -96,6 +100,7 @@ while [[ $# -gt 0 ]]; do
     --no-worker)     SETUP_WORKER=0; shift ;;
     --start-worker)  START_WORKER=1; shift ;;
     --deploy-key)    DEPLOY_KEY=1; shift ;;
+    --install)       INSTALL_DEPS=1; shift ;;
     --clone)         CLONE_URL="${2:?}"; shift 2 ;;
     --branch)        CLONE_BRANCH="${2:?}"; shift 2 ;;
     --user)          CODE_USER="${2:?}"; shift 2 ;;
@@ -112,6 +117,7 @@ done
 [[ "$DEPLOY_KEY" -eq 0 || "$REMOVE" -eq 0 ]] || die "--deploy-key can't be combined with --remove (removing an app deletes its deploy key)"
 [[ "$DROP_DB" -eq 0 || "$REMOVE" -eq 1 ]] || die "--drop-db only makes sense together with --remove"
 [[ -z "$CLONE_URL" || "$REMOVE" -eq 0 ]] || die "--clone can't be combined with --remove"
+[[ "$INSTALL_DEPS" -eq 0 || "$REMOVE" -eq 0 ]] || die "--install can't be combined with --remove"
 if [[ -n "$CLONE_URL" ]]; then
   # SSH URLs only: a private repo over HTTPS would need a token, which this script does not store.
   [[ "$CLONE_URL" =~ ^(git@[A-Za-z0-9.-]+:[A-Za-z0-9._/-]+|ssh://git@[A-Za-z0-9.-]+(:[0-9]+)?/[A-Za-z0-9._/-]+)$ ]] \
@@ -176,8 +182,9 @@ setup_permissions() {
   local d owner
   owner="$(stat -c %U "$APP_DIR")"
   # Create any missing writable dirs, owned by whoever owns the app (not root).
-  for d in storage bootstrap/cache; do
-    [[ -d "$APP_DIR/$d" ]] || { mkdir -p "$APP_DIR/$d"; chown "$owner" "$APP_DIR/$d"; }
+  # (each path component separately, so a missing parent such as bootstrap/ isn't left root-owned)
+  for d in storage bootstrap bootstrap/cache; do
+    [[ -d "$APP_DIR/$d" ]] || { mkdir "$APP_DIR/$d"; chown "$owner" "$APP_DIR/$d"; }
   done
   chgrp -R "$WEB_GROUP" "$APP_DIR"
   chmod -R g+rX,o-w "$APP_DIR"       # web group can read; nobody else can write
@@ -465,6 +472,58 @@ setup_deploy_key() {
 }
 
 # --------------------------------------------------------------------------
+# Dependencies: composer + npm, run as the user who owns the code (never as root)
+# --------------------------------------------------------------------------
+install_dependencies() {
+  log "Installing dependencies"
+  local owner home
+  owner="$(stat -c %U "$APP_DIR")"
+  home="$(getent passwd "$owner" | cut -d: -f6)"
+  [[ -n "$home" && -d "$home" ]] || { warn "no home directory for '${owner}'; skipping --install"; INSTALL_FAILED=1; return 0; }
+
+  # Run a command in the app directory as its owner, with a sane HOME and the PATH we set up.
+  as_owner() {
+    local -a envs=(HOME="$home" PATH="$PATH")
+    [[ "$owner" != "root" ]] || envs+=(COMPOSER_ALLOW_SUPERUSER=1)
+    ( cd "$APP_DIR" && runuser -u "$owner" -- env "${envs[@]}" "$@" )
+  }
+
+  if [[ -f "$APP_DIR/composer.json" ]]; then
+    if have composer; then
+      echo "composer install (as ${owner})"
+      as_owner composer install --no-dev --optimize-autoloader --no-interaction --prefer-dist \
+        || { warn "composer install failed (see output above)"; INSTALL_FAILED=1; }
+    else
+      warn "composer not found; skipping composer install"; INSTALL_FAILED=1
+    fi
+  else
+    echo "No composer.json; skipping composer"
+  fi
+
+  if [[ -f "$APP_DIR/package.json" ]]; then
+    if have npm; then
+      if [[ -f "$APP_DIR/package-lock.json" ]]; then
+        echo "npm ci (as ${owner})"
+        as_owner npm ci --no-audit --no-fund || { warn "npm ci failed (see output above)"; INSTALL_FAILED=1; return 0; }
+      else
+        echo "npm install (no package-lock.json; as ${owner})"
+        as_owner npm install --no-audit --no-fund || { warn "npm install failed (see output above)"; INSTALL_FAILED=1; return 0; }
+      fi
+      if as_owner node -e 'process.exit(((require("./package.json").scripts||{}).build)?0:1)' 2>/dev/null; then
+        echo "npm run build"
+        as_owner npm run build || { warn "npm run build failed (see output above)"; INSTALL_FAILED=1; }
+      else
+        echo "No \"build\" script in package.json; skipping npm run build"
+      fi
+    else
+      warn "package.json found but npm is not installed (was Node.js skipped with --no-node?); skipping npm"; INSTALL_FAILED=1
+    fi
+  else
+    echo "No package.json; skipping npm"
+  fi
+}
+
+# --------------------------------------------------------------------------
 # Clone a private repo over SSH with a per-app deploy key
 # --------------------------------------------------------------------------
 clone_repo() {
@@ -632,6 +691,9 @@ if [[ -n "$CLONE_URL" ]]; then
   validate_app_dir
 fi
 
+# Before setup_permissions, so everything the install creates gets the web group and modes.
+[[ "$INSTALL_DEPS" -eq 1 ]] && install_dependencies
+
 setup_permissions
 setup_selinux
 if [[ "$SETUP_DB" -eq 1 ]]; then
@@ -654,3 +716,7 @@ cat <<EOF
 
   Remember: set DB_* in .env, then run migrations (php artisan migrate --force).
 EOF
+if [[ "$INSTALL_DEPS" -eq 1 && "$INSTALL_FAILED" -eq 1 ]]; then
+  warn "Setup finished, but installing dependencies failed or was skipped (see the warnings above)."
+  exit 1
+fi
