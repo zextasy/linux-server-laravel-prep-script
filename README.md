@@ -23,6 +23,7 @@ can host as many apps as you like on one server.
 | Database | PostgreSQL (distro packages), listening on localhost |
 | Cache/queues | Redis (Valkey on EL10) |
 | Tooling | Composer (installer checksum verified; an existing install is updated to the current stable release), Node.js (tarball checksum verified), git, unzip, cron, Supervisor |
+| HTTPS | certbot with the Nginx plugin (Let's Encrypt) and its automatic-renewal timer (`--no-certbot` to skip) |
 | Hardening | Firewall (ufw / firewalld) allowing SSH, 80 and 443; SELinux booleans on RHEL-family |
 
 **Per app (`laravel-app.sh`)**
@@ -57,17 +58,25 @@ derivatives such as Mint. Containers without systemd also won't work.
 > tested with the earlier single-script version, whose server part is unchanged
 > apart from the app/database steps moving to `laravel-app`.
 >
-> | Distro | PostgreSQL | Notes |
-> |--------|-----------|-------|
-> | Ubuntu 24.04 | 16 | |
-> | Debian 12 | 15 | |
-> | Rocky Linux 9 | 13 | |
-> | AlmaLinux 8 | 16 | uses the `postgresql:16` module stream |
-> | AlmaLinux 9 | 13 | |
-> | Oracle Linux 9 | 13 | uses `oracle-epel-release`; x86_64 tested, aarch64 only dependency-resolved (see notes) |
-> | CentOS Stream 9 | 13 | |
-> | CentOS Stream 10 | 16 | Valkey instead of Redis |
-> | Fedora 43 | 18 | dnf5 |
+> | Distro | PostgreSQL | certbot | Notes |
+> |--------|-----------|---------|-------|
+> | Ubuntu 24.04 | 16 | 2.9 | |
+> | Debian 12 | 15 | 2.1 | |
+> | Rocky Linux 9 | 13 | 3.1 | |
+> | AlmaLinux 8 | 16 | 1.22 | uses the `postgresql:16` module stream |
+> | AlmaLinux 9 | 13 | 3.1 | |
+> | Oracle Linux 9 | 13 | 3.1 | uses `oracle-epel-release`; x86_64 tested, aarch64 only dependency-resolved (see notes) |
+> | CentOS Stream 9 | 13 | 3.1 | |
+> | CentOS Stream 10 | 16 | 4.2 | Valkey instead of Redis |
+> | Fedora 43 | 18 | 5.7 | dnf5; needs `python3-pyparsing` for certbot's nginx plugin (installed automatically) |
+>
+> **certbot / `--https`** was tested on every distro in the table with real certbot
+> against a local ACME test CA ([Pebble](https://github.com/letsencrypt/pebble)):
+> issuing and deploying a certificate, the HTTP-to-HTTPS redirect, serving over TLS,
+> a re-run keeping the certificate, `certbot renew --dry-run`, a forced renewal that
+> Nginx picks up, and `--remove` deleting the certificate. It has **not** been run
+> against the real Let's Encrypt (which needs a public domain). `--clone`,
+> `--install` and `--deploy-key` were exercised on Ubuntu 24.04 only.
 >
 > **Not tested:** RHEL itself (needs a subscription; Rocky/Alma/Oracle are
 > rebuilds of it), Fedora 44+, other Ubuntu/Debian releases, the **firewall
@@ -89,6 +98,7 @@ sudo ./laravel-prep.sh
 | `--php-version X.Y` | `8.4` | PHP version |
 | `--node-version N` | `22` | Node.js major version |
 | `--no-node` | | Skip Node.js |
+| `--no-certbot` | | Skip certbot |
 | `--skip-firewall` | | Leave the firewall alone |
 
 Read the scripts before running them: they install packages, edit the firewall
@@ -125,6 +135,9 @@ cd /var/www/shop && sudo laravel-app --domain shop.example.com --update-env
 | `--clone URL` | | Clone a private repo over SSH with a per-app deploy key, then set it up (see below) |
 | `--branch BRANCH` | | With `--clone`: branch or tag to check out |
 | `--user USER` | the user who ran `sudo` | With `--clone`: Unix user that owns the code (created if missing) |
+| `--https` | | Get a Let's Encrypt certificate for `--domain` and switch the site to HTTPS (see below) |
+| `--email EMAIL` | | With `--https`: contact address for Let's Encrypt (required the first time on a server) |
+| `--staging` | | With `--https`: use Let's Encrypt's staging CA (untrusted certificate, no rate limits) |
 | `--install` | | Install dependencies as the code's owner: `composer install` and, if there is a `package.json`, `npm ci` + `npm run build` |
 | `--deploy-key` | | Create an SSH deploy key for the app's owner and point the app's git repo at it (see below) |
 | `--force` | | Continue even if there is no `artisan` file |
@@ -169,6 +182,39 @@ Only SSH URLs are accepted (`git@host:owner/repo.git` or `ssh://git@host/...`); 
 private repo over HTTPS would need a token, which these scripts don't store. Re-running
 with the same URL reuses the existing checkout and key. The clone doesn't run
 `composer install` or build assets; do that as the code's owner afterwards (see below).
+
+### HTTPS with Let's Encrypt (`--https`)
+
+```bash
+sudo laravel-app --domain shop.example.com --https --email you@example.com
+# or together with the clone:
+sudo laravel-app --clone git@github.com:acme/shop.git --domain shop.example.com --https --email you@example.com --install
+```
+
+This runs certbot's Nginx plugin for the app's domain: it gets a free certificate,
+adds the HTTPS listener to the app's vhost and redirects HTTP to HTTPS.
+
+Before you run it:
+
+- The domain's DNS record must **already point at this server**, and ports 80 and 443
+  must be reachable from the internet (`laravel-prep.sh` opens both in the firewall).
+  Let's Encrypt checks by fetching a file over port 80.
+- Pass `--email` the first time on a server (Let's Encrypt sends expiry notices there);
+  later apps reuse the same account.
+- You need a real domain name. The catch-all vhost and bare IP addresses can't get a
+  certificate. Try `--staging` first if you are experimenting, to avoid Let's Encrypt's
+  rate limits (it issues untrusted test certificates).
+
+Renewal is automatic: `laravel-prep.sh` enables certbot's systemd timer
+(`certbot.timer` on Debian/Ubuntu, `certbot-renew.timer` on RHEL-family/Fedora), and
+Nginx is reloaded when a certificate renews. Check it any time with
+`sudo certbot renew --dry-run`.
+
+If certbot fails (DNS not ready, port blocked, rate limit), the rest of the setup still
+completes, the site keeps working over HTTP, and the script exits 1 with the reason
+printed; fix the cause and re-run the same command. Re-running when a valid certificate
+exists keeps it. `laravel-app --remove` deletes the app's certificate (it does not
+revoke it).
 
 ### Installing dependencies (`--install`)
 
@@ -256,8 +302,8 @@ removed, requests for its old hostname fall through to Nginx's default vhost
    sudo supervisorctl reread && sudo supervisorctl update
    sudo supervisorctl start <app>-worker
    ```
-4. **Enable HTTPS** with [certbot](https://certbot.eff.org/) once the domain
-   points at the server.
+4. **Enable HTTPS** once the domain points at the server: re-run
+   `sudo laravel-app --https --email you@example.com` in the app directory (see above).
 
 If you re-deploy files with a different group, run `sudo laravel-app` again to
 restore the permissions.

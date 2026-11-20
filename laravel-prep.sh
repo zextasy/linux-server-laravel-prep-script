@@ -3,8 +3,8 @@
 # laravel-prep.sh - one-time setup of a Linux server for hosting Laravel apps.
 #
 # Installs and configures: PHP (+ FPM and the extensions Laravel needs), Nginx,
-# PostgreSQL, Redis, Composer, Node.js, Supervisor, cron, SELinux booleans and a
-# firewall. It does NOT set up any individual app: run `laravel-app` (installed
+# PostgreSQL, Redis, Composer, Node.js, Supervisor, cron, certbot (Let's Encrypt,
+# with automatic renewal), SELinux booleans and a firewall. It does NOT set up any individual app: run `laravel-app` (installed
 # by this script from laravel-app.sh) from each app's directory for that.
 #
 # Supported: Ubuntu, Debian, RHEL, CentOS Stream, Rocky Linux, AlmaLinux,
@@ -24,6 +24,7 @@ export PATH="/usr/local/sbin:/usr/local/bin:${PATH}"
 PHP_VERSION="${PHP_VERSION:-8.4}"
 NODE_MAJOR="${NODE_MAJOR:-22}"
 INSTALL_NODE=1
+INSTALL_CERTBOT=1
 SETUP_FIREWALL=1
 
 usage() {
@@ -33,6 +34,7 @@ Usage: sudo $0 [options]
   --php-version X.Y     PHP version to install            (default: $PHP_VERSION)
   --node-version N      Node.js major version             (default: $NODE_MAJOR)
   --no-node             Skip Node.js
+  --no-certbot          Skip certbot (no HTTPS certificates via laravel-app --https)
   --skip-firewall       Do not touch the firewall
   -h, --help            Show this help
 EOF
@@ -43,6 +45,7 @@ while [[ $# -gt 0 ]]; do
     --php-version)   PHP_VERSION="${2:?}"; shift 2 ;;
     --node-version)  NODE_MAJOR="${2:?}"; shift 2 ;;
     --no-node)       INSTALL_NODE=0; shift ;;
+    --no-certbot)    INSTALL_CERTBOT=0; shift ;;
     --skip-firewall) SETUP_FIREWALL=0; shift ;;
     -h|--help)       usage; exit 0 ;;
     *) echo "Unknown option: $1" >&2; usage >&2; exit 1 ;;
@@ -358,6 +361,34 @@ install_node() {
 }
 
 # --------------------------------------------------------------------------
+# certbot (Let's Encrypt) with the Nginx plugin, plus automatic renewal
+# --------------------------------------------------------------------------
+install_certbot() {
+  log "Installing certbot"
+  # Debian/Ubuntu: distro packages. RHEL family: from EPEL (enabled earlier). Fedora: distro packages.
+  pkg_try certbot python3-certbot-nginx
+  if ! have certbot; then
+    warn "certbot could not be installed; laravel-app --https will not work (install certbot and python3-certbot-nginx yourself)"
+    return 0
+  fi
+  # The nginx plugin must load. Fedora's python3-certbot-nginx doesn't depend on pyparsing, so the
+  # plugin fails with "No module named 'pyparsing'" until it is installed.
+  if ! certbot plugins 2>/dev/null | grep -q '^\* nginx'; then
+    pkg_try python3-pyparsing
+    certbot plugins 2>/dev/null | grep -q '^\* nginx' \
+      || warn "the certbot nginx plugin does not load; run 'certbot plugins' to see why (laravel-app --https needs it)"
+  fi
+  # Renewal runs from a systemd timer: certbot.timer (Debian/Ubuntu) or certbot-renew.timer (EPEL/Fedora).
+  local t enabled=0
+  for t in certbot.timer certbot-renew.timer; do
+    if systemctl cat "$t" >/dev/null 2>&1; then
+      systemctl enable --now "$t" && enabled=1
+    fi
+  done
+  [[ "$enabled" -eq 1 ]] || warn "no certbot renewal timer found; set up renewal yourself (e.g. a cron job running 'certbot renew')"
+}
+
+# --------------------------------------------------------------------------
 # SELinux (RHEL family): let nginx/php-fpm reach PostgreSQL/Redis. Per-app file
 # labels are applied by laravel-app.
 # --------------------------------------------------------------------------
@@ -447,6 +478,7 @@ install_redis
 install_tools
 install_composer
 [[ "$INSTALL_NODE" -eq 1 ]] && install_node
+[[ "$INSTALL_CERTBOT" -eq 1 ]] && install_certbot
 configure_selinux
 [[ "$SETUP_FIREWALL" -eq 1 ]] && setup_firewall
 write_state
@@ -460,6 +492,7 @@ v_nginx=""; have nginx && v_nginx="$(nginx -v 2>&1 | sed 's|.*/||' || true)"
 v_pg="$(psql --version 2>/dev/null | awk '{print $3}' || true)"
 v_composer="$(composer --version 2>/dev/null | awk '{print $3}' || true)"
 v_node="$(node -v 2>/dev/null || true)"
+v_certbot=""; have certbot && v_certbot="$(certbot --version 2>/dev/null | awk '{print $2}' || true)"
 
 cat <<EOF
 
@@ -468,6 +501,7 @@ cat <<EOF
   PostgreSQL : ${v_pg:-not found}
   Composer   : ${v_composer:-not found}
   Node.js    : ${v_node:-$([[ "$INSTALL_NODE" -eq 1 ]] && echo "not found" || echo skipped)}
+  Certbot    : ${v_certbot:-$([[ "$INSTALL_CERTBOT" -eq 1 ]] && echo "not found" || echo skipped)}
 
   Next step  : cd into a Laravel app directory and run:  sudo laravel-app --domain example.com
 EOF
