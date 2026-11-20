@@ -76,7 +76,14 @@ derivatives such as Mint. Containers without systemd also won't work.
 > a re-run keeping the certificate, `certbot renew --dry-run`, a forced renewal that
 > Nginx picks up, and `--remove` deleting the certificate. It has **not** been run
 > against the real Let's Encrypt (which needs a public domain). `--clone`,
-> `--install` and `--deploy-key` were exercised on Ubuntu 24.04 only.
+> `--install` and `--deploy-key` were tested (against a local SSH git server, with
+> real Composer and npm runs) on Ubuntu 24.04, Debian 12, AlmaLinux 8 and 9, Oracle
+> Linux 9, CentOS Stream 9 and 10, and Fedora 43: the deploy key and its permissions,
+> an unauthorised key stopping safely, clone + install + permissions + serving, `.env`
+> from `.env.example`, a plain `git pull` with the deploy key, re-running on an
+> existing checkout, `--branch` with the interactive Enter-to-retry flow, refusals
+> (HTTPS URL, non-empty target), and `--remove` deleting the key while keeping the
+> code. Rocky Linux 9 was not run through this set.
 >
 > **Not tested:** RHEL itself (needs a subscription; Rocky/Alma/Oracle are
 > rebuilds of it), Fedora 44+, other Ubuntu/Debian releases, the **firewall
