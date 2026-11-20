@@ -58,17 +58,25 @@ derivatives such as Mint. Containers without systemd also won't work.
 > tested with the earlier single-script version, whose server part is unchanged
 > apart from the app/database steps moving to `laravel-app`.
 >
-> | Distro | PostgreSQL | Notes |
-> |--------|-----------|-------|
-> | Ubuntu 24.04 | 16 | |
-> | Debian 12 | 15 | |
-> | Rocky Linux 9 | 13 | |
-> | AlmaLinux 8 | 16 | uses the `postgresql:16` module stream |
-> | AlmaLinux 9 | 13 | |
-> | Oracle Linux 9 | 13 | uses `oracle-epel-release`; x86_64 tested, aarch64 only dependency-resolved (see notes) |
-> | CentOS Stream 9 | 13 | |
-> | CentOS Stream 10 | 16 | Valkey instead of Redis |
-> | Fedora 43 | 18 | dnf5 |
+> | Distro | PostgreSQL | certbot | Notes |
+> |--------|-----------|---------|-------|
+> | Ubuntu 24.04 | 16 | 2.9 | |
+> | Debian 12 | 15 | 2.1 | |
+> | Rocky Linux 9 | 13 | 3.1 | |
+> | AlmaLinux 8 | 16 | 1.22 | uses the `postgresql:16` module stream |
+> | AlmaLinux 9 | 13 | 3.1 | |
+> | Oracle Linux 9 | 13 | 3.1 | uses `oracle-epel-release`; x86_64 tested, aarch64 only dependency-resolved (see notes) |
+> | CentOS Stream 9 | 13 | 3.1 | |
+> | CentOS Stream 10 | 16 | 4.2 | Valkey instead of Redis |
+> | Fedora 43 | 18 | 5.7 | dnf5; needs `python3-pyparsing` for certbot's nginx plugin (installed automatically) |
+>
+> **certbot / `--https`** was tested on every distro in the table with real certbot
+> against a local ACME test CA ([Pebble](https://github.com/letsencrypt/pebble)):
+> issuing and deploying a certificate, the HTTP-to-HTTPS redirect, serving over TLS,
+> a re-run keeping the certificate, `certbot renew --dry-run`, a forced renewal that
+> Nginx picks up, and `--remove` deleting the certificate. It has **not** been run
+> against the real Let's Encrypt (which needs a public domain). `--clone`,
+> `--install` and `--deploy-key` were exercised on Ubuntu 24.04 only.
 >
 > **Not tested:** RHEL itself (needs a subscription; Rocky/Alma/Oracle are
 > rebuilds of it), Fedora 44+, other Ubuntu/Debian releases, the **firewall
