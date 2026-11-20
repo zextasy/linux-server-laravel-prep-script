@@ -42,6 +42,10 @@ FORCE=0
 DEPLOY_KEY=0
 INSTALL_DEPS=0
 INSTALL_FAILED=0
+HTTPS=0
+HTTPS_FAILED=0
+ACME_EMAIL=""
+ACME_STAGING=0
 CLONE_URL=""
 CLONE_BRANCH=""
 CODE_USER=""
@@ -70,6 +74,12 @@ Usage: cd /path/to/laravel-app && sudo $(basename "$0") [options]
   --branch BRANCH     With --clone: branch or tag to check out (default: the repo's default branch)
   --user USER         With --clone: Unix user that owns the code (default: the user who ran sudo;
                       created if missing)
+  --https             Get a free Let's Encrypt certificate for --domain with certbot and switch the site
+                      to HTTPS (HTTP redirects to HTTPS). The domain must already point at this server.
+  --email EMAIL       With --https: contact address for Let's Encrypt (expiry notices). Required the
+                      first time on a server.
+  --staging           With --https: use Let's Encrypt's staging CA (untrusted test certificate, but
+                      no rate limits) to try things out
   --install           Install dependencies as the code's owner: composer install (--no-dev, optimized
                       autoloader) and, if there is a package.json, npm ci/install and npm run build
   --deploy-key        Create an SSH deploy key for the app's owner (to pull a private repo) and
@@ -101,6 +111,9 @@ while [[ $# -gt 0 ]]; do
     --start-worker)  START_WORKER=1; shift ;;
     --deploy-key)    DEPLOY_KEY=1; shift ;;
     --install)       INSTALL_DEPS=1; shift ;;
+    --https)         HTTPS=1; shift ;;
+    --email)         ACME_EMAIL="${2:?}"; shift 2 ;;
+    --staging)       ACME_STAGING=1; shift ;;
     --clone)         CLONE_URL="${2:?}"; shift 2 ;;
     --branch)        CLONE_BRANCH="${2:?}"; shift 2 ;;
     --user)          CODE_USER="${2:?}"; shift 2 ;;
@@ -118,6 +131,14 @@ done
 [[ "$DROP_DB" -eq 0 || "$REMOVE" -eq 1 ]] || die "--drop-db only makes sense together with --remove"
 [[ -z "$CLONE_URL" || "$REMOVE" -eq 0 ]] || die "--clone can't be combined with --remove"
 [[ "$INSTALL_DEPS" -eq 0 || "$REMOVE" -eq 0 ]] || die "--install can't be combined with --remove"
+[[ "$HTTPS" -eq 0 || "$REMOVE" -eq 0 ]] || die "--https can't be combined with --remove (removing an app deletes its certificate)"
+if [[ "$HTTPS" -eq 1 ]]; then
+  [[ "$DOMAIN" != "_" ]] || die "--https needs a real --domain (Let's Encrypt can't issue a certificate for the catch-all)"
+  [[ "$DOMAIN" =~ [A-Za-z] && "$DOMAIN" == *.* ]] || die "--https needs a fully qualified domain name (got: $DOMAIN)"
+  [[ -z "$ACME_EMAIL" || "$ACME_EMAIL" =~ ^[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}$ ]] || die "Invalid --email: $ACME_EMAIL"
+elif [[ -n "$ACME_EMAIL" || "$ACME_STAGING" -eq 1 ]]; then
+  die "--email and --staging only apply together with --https"
+fi
 if [[ -n "$CLONE_URL" ]]; then
   # SSH URLs only: a private repo over HTTPS would need a token, which this script does not store.
   [[ "$CLONE_URL" =~ ^(git@[A-Za-z0-9.-]+:[A-Za-z0-9._/-]+|ssh://git@[A-Za-z0-9.-]+(:[0-9]+)?/[A-Za-z0-9._/-]+)$ ]] \
@@ -573,6 +594,37 @@ clone_repo() {
 }
 
 # --------------------------------------------------------------------------
+# HTTPS: Let's Encrypt certificate via certbot's nginx plugin
+# --------------------------------------------------------------------------
+setup_https() {
+  log "Requesting a Let's Encrypt certificate for ${DOMAIN}"
+  if ! have certbot; then
+    warn "certbot is not installed (was laravel-prep.sh run with --no-certbot?). Install certbot and python3-certbot-nginx, then re-run with --https."
+    HTTPS_FAILED=1; return 0
+  fi
+  getent hosts "$DOMAIN" >/dev/null 2>&1 \
+    || warn "${DOMAIN} does not resolve from this server yet; Let's Encrypt must be able to reach it by that name on port 80"
+
+  local -a args=(--nginx -d "$DOMAIN" --non-interactive --agree-tos --redirect --keep-until-expiring)
+  if [[ -n "$ACME_EMAIL" ]]; then
+    args+=(-m "$ACME_EMAIL")
+  elif ! compgen -G "/etc/letsencrypt/accounts/*/directory/*/regr.json" >/dev/null; then
+    warn "--https needs --email on the first run (Let's Encrypt sends expiry notices there)."
+    HTTPS_FAILED=1; return 0
+  fi
+  [[ "$ACME_STAGING" -eq 0 ]] || args+=(--staging)
+
+  if certbot "${args[@]}"; then
+    systemctl reload nginx
+    echo "HTTPS enabled: https://${DOMAIN}/ (renewal is automatic; test with: certbot renew --dry-run)"
+  else
+    warn "certbot could not get a certificate for ${DOMAIN} (see the output above). Common causes: the DNS record doesn't point at this server yet, or port 80/443 is blocked."
+    warn "The site still works over HTTP. Fix the cause and re-run the same command."
+    HTTPS_FAILED=1
+  fi
+}
+
+# --------------------------------------------------------------------------
 # Remove: undo what this script set up for one app (never touches the app's code)
 # --------------------------------------------------------------------------
 remove_app() {
@@ -639,7 +691,18 @@ remove_app() {
   done
 
   if [[ -f "$conf" ]]; then
-    found=1; rm -f "$conf"; echo "Removed $conf"
+    found=1
+    # Delete this app's Let's Encrypt certificate, if it has one (named after the vhost's domain).
+    local site
+    site="$(awk '$1=="server_name"{gsub(";","",$2); print $2; exit}' "$conf")"
+    if [[ "$site" =~ ^[A-Za-z0-9._-]+$ && -f "/etc/letsencrypt/renewal/${site}.conf" ]] && have certbot; then
+      # Remove the vhost first so certbot is not asked to touch a config we are deleting.
+      rm -f "$conf"
+      certbot delete --cert-name "$site" --non-interactive >/dev/null 2>&1 \
+        && echo "Deleted the Let's Encrypt certificate for ${site} (it is not revoked)" \
+        || warn "could not delete the certificate for ${site}; remove it with: certbot delete --cert-name ${site}"
+    fi
+    rm -f "$conf"; echo "Removed $conf"
     if nginx -t >/dev/null 2>&1; then
       systemctl reload nginx
     else
@@ -704,19 +767,20 @@ setup_vhost
 [[ "$SETUP_SCHEDULER" -eq 1 ]] && setup_scheduler
 [[ "$SETUP_WORKER" -eq 1 ]] && setup_worker
 [[ "$DEPLOY_KEY" -eq 1 ]] && setup_deploy_key
+[[ "$HTTPS" -eq 1 ]] && setup_https
 
 log "Done"
 cat <<EOF
 
   App        : ${APP_NAME}  (${APP_DIR})
-  URL        : http://${DOMAIN/#_/<server-ip>}/
+  URL        : $([[ "$HTTPS" -eq 1 && "$HTTPS_FAILED" -eq 0 ]] && echo "https" || echo "http")://${DOMAIN/#_/<server-ip>}/
   Database   : ${DB_NAME} (role ${DB_USER})$([[ "$SETUP_DB" -eq 1 ]] && echo "  creds: /root/.laravel-prep/${APP_NAME}.env")
   Scheduler  : $([[ "$SETUP_SCHEDULER" -eq 1 ]] && echo "/etc/cron.d/laravel-${APP_NAME}" || echo skipped)
   Worker     : $([[ "$SETUP_WORKER" -eq 1 ]] && echo "${APP_NAME}-worker $([[ "$START_WORKER" -eq 1 ]] && echo '(started)' || echo '(defined, not started: supervisorctl reread && supervisorctl update && supervisorctl start '"${APP_NAME}"'-worker)')" || echo skipped)
 
   Remember: set DB_* in .env, then run migrations (php artisan migrate --force).
 EOF
-if [[ "$INSTALL_DEPS" -eq 1 && "$INSTALL_FAILED" -eq 1 ]]; then
-  warn "Setup finished, but installing dependencies failed or was skipped (see the warnings above)."
+if [[ ( "$INSTALL_DEPS" -eq 1 && "$INSTALL_FAILED" -eq 1 ) || "$HTTPS_FAILED" -eq 1 ]]; then
+  warn "Setup finished, but a step you asked for failed or was skipped (see the warnings above)."
   exit 1
 fi
