@@ -371,6 +371,13 @@ install_certbot() {
     warn "certbot could not be installed; laravel-app --https will not work (install certbot and python3-certbot-nginx yourself)"
     return 0
   fi
+  # The nginx plugin must load. Fedora's python3-certbot-nginx doesn't depend on pyparsing, so the
+  # plugin fails with "No module named 'pyparsing'" until it is installed.
+  if ! certbot plugins 2>/dev/null | grep -q '^\* nginx'; then
+    pkg_try python3-pyparsing
+    certbot plugins 2>/dev/null | grep -q '^\* nginx' \
+      || warn "the certbot nginx plugin does not load; run 'certbot plugins' to see why (laravel-app --https needs it)"
+  fi
   # Renewal runs from a systemd timer: certbot.timer (Debian/Ubuntu) or certbot-renew.timer (EPEL/Fedora).
   local t enabled=0
   for t in certbot.timer certbot-renew.timer; do
@@ -485,7 +492,7 @@ v_nginx=""; have nginx && v_nginx="$(nginx -v 2>&1 | sed 's|.*/||' || true)"
 v_pg="$(psql --version 2>/dev/null | awk '{print $3}' || true)"
 v_composer="$(composer --version 2>/dev/null | awk '{print $3}' || true)"
 v_node="$(node -v 2>/dev/null || true)"
-v_certbot=""; have certbot && v_certbot="$(certbot --version 2>&1 | awk '{print $2}' || true)"
+v_certbot=""; have certbot && v_certbot="$(certbot --version 2>/dev/null | awk '{print $2}' || true)"
 
 cat <<EOF
 
