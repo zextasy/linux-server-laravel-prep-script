@@ -21,6 +21,8 @@ export PATH="/usr/local/sbin:/usr/local/bin:${PATH}"
 # --------------------------------------------------------------------------
 # Defaults (override with flags or environment variables)
 # --------------------------------------------------------------------------
+PHP_VERSION_EXPLICIT=0
+[[ -z "${PHP_VERSION:-}" ]] || PHP_VERSION_EXPLICIT=1
 PHP_VERSION="${PHP_VERSION:-8.4}"
 NODE_MAJOR="${NODE_MAJOR:-22}"
 INSTALL_NODE=1
@@ -31,7 +33,8 @@ usage() {
   cat <<EOF
 Usage: sudo $0 [options]
 
-  --php-version X.Y     PHP version to install            (default: $PHP_VERSION)
+  --php-version X.Y     PHP version to install            (default: $PHP_VERSION; on Debian/Ubuntu,
+                        if that isn't available the distro's own PHP is used unless you pass this)
   --node-version N      Node.js major version             (default: $NODE_MAJOR)
   --no-node             Skip Node.js
   --no-certbot          Skip certbot (no HTTPS certificates via laravel-app --https)
@@ -42,7 +45,7 @@ EOF
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
-    --php-version)   PHP_VERSION="${2:?}"; shift 2 ;;
+    --php-version)   PHP_VERSION="${2:?}"; PHP_VERSION_EXPLICIT=1; shift 2 ;;
     --node-version)  NODE_MAJOR="${2:?}"; shift 2 ;;
     --no-node)       INSTALL_NODE=0; shift ;;
     --no-certbot)    INSTALL_CERTBOT=0; shift ;;
@@ -65,6 +68,14 @@ have() { command -v "$1" >/dev/null 2>&1; }
 [[ "$NODE_MAJOR" =~ ^[0-9]+$ ]]              || die "Invalid --node-version: $NODE_MAJOR"
 
 PHP_NODOT="${PHP_VERSION/./}"
+
+# Debian/Ubuntu PHP layout for the current $PHP_VERSION (called again if we fall back to another version).
+set_apt_php_vars() {
+  PHP_NODOT="${PHP_VERSION/./}"
+  FPM_SERVICE="php${PHP_VERSION}-fpm"
+  FPM_PASS="unix:/run/php/php${PHP_VERSION}-fpm.sock"
+  PHP_INI_DIRS=("/etc/php/${PHP_VERSION}/fpm/conf.d" "/etc/php/${PHP_VERSION}/cli/conf.d")
+}
 
 [[ $EUID -eq 0 ]] || die "Run as root (e.g. sudo $0)"
 [[ -d /run/systemd/system ]] || die "systemd is required (containers without systemd are not supported)"
@@ -101,9 +112,7 @@ case "$FAMILY" in
     PM=apt
     WEB_USER=www-data; WEB_GROUP=www-data
     PHP_BIN=/usr/bin/php
-    FPM_SERVICE="php${PHP_VERSION}-fpm"
-    FPM_PASS="unix:/run/php/php${PHP_VERSION}-fpm.sock"
-    PHP_INI_DIRS=("/etc/php/${PHP_VERSION}/fpm/conf.d" "/etc/php/${PHP_VERSION}/cli/conf.d")
+    set_apt_php_vars
     PG_SERVICE=postgresql
     SUPERVISOR_SERVICE=supervisor
     SUPERVISOR_CONF_DIR=/etc/supervisor/conf.d; SUPERVISOR_CONF_EXT=conf
@@ -155,16 +164,28 @@ export DEBIAN_FRONTEND=noninteractive
 setup_repos_apt() {
   pkg_update
   pkg_install ca-certificates curl gnupg lsb-release apt-transport-https
+  # Ondrej Sury's PHP repository (PPA on Ubuntu, packages.sury.org on Debian). It lags behind new OS
+  # releases: skip it when it has no suite for this release, and fall back to the distro's own PHP.
+  local release_url
   if [[ "$FAMILY" == "ubuntu" ]]; then
-    pkg_install software-properties-common
-    add-apt-repository -y ppa:ondrej/php
+    release_url="https://ppa.launchpadcontent.net/ondrej/php/ubuntu/dists/${VERSION_CODENAME}/Release"
   else
-    local tmp; tmp="$(mktemp -d)"
-    curl -fsSL -o "$tmp/keyring.deb" https://packages.sury.org/debsuryorg-archive-keyring.deb
-    dpkg -i "$tmp/keyring.deb"
-    rm -rf "$tmp"
-    echo "deb [signed-by=/usr/share/keyrings/debsuryorg-archive-keyring.gpg] https://packages.sury.org/php/ ${VERSION_CODENAME} main" \
-      > /etc/apt/sources.list.d/php.list
+    release_url="https://packages.sury.org/php/dists/${VERSION_CODENAME}/Release"
+  fi
+  if curl -fs --max-time 30 -o /dev/null "$release_url" 2>/dev/null; then
+    if [[ "$FAMILY" == "ubuntu" ]]; then
+      pkg_install software-properties-common
+      add-apt-repository -y ppa:ondrej/php
+    else
+      local tmp; tmp="$(mktemp -d)"
+      curl -fsSL -o "$tmp/keyring.deb" https://packages.sury.org/debsuryorg-archive-keyring.deb
+      dpkg -i "$tmp/keyring.deb"
+      rm -rf "$tmp"
+      echo "deb [signed-by=/usr/share/keyrings/debsuryorg-archive-keyring.gpg] https://packages.sury.org/php/ ${VERSION_CODENAME} main" \
+        > /etc/apt/sources.list.d/php.list
+    fi
+  else
+    warn "The Sury PHP repository has no suite for ${VERSION_CODENAME}; not adding it (the distro's own PHP will be used)"
   fi
   pkg_update
 }
@@ -205,6 +226,17 @@ setup_repos_dnf() {
 # PHP + web server + database + cache
 # --------------------------------------------------------------------------
 install_php() {
+  if [[ "$PM" == apt ]] && ! apt-cache show "php${PHP_VERSION}-fpm" >/dev/null 2>&1; then
+    # The requested version isn't available (e.g. the Sury repo has no packages yet for a new OS release).
+    local avail
+    avail="$(apt-cache pkgnames 2>/dev/null | sed -nE 's/^php([0-9]+\.[0-9]+)-fpm$/\1/p' | sort -V | tail -1)"
+    [[ -n "$avail" ]] || die "No PHP packages are available for ${PRETTY_NAME} from the configured repositories."
+    if [[ "$PHP_VERSION_EXPLICIT" -eq 1 ]]; then
+      die "PHP ${PHP_VERSION} isn't available for ${PRETTY_NAME}. The newest available is PHP ${avail}: re-run with --php-version ${avail}, or without --php-version."
+    fi
+    warn "PHP ${PHP_VERSION} isn't available for ${PRETTY_NAME}; using PHP ${avail} instead"
+    PHP_VERSION="$avail"; set_apt_php_vars
+  fi
   log "Installing PHP ${PHP_VERSION}"
   if [[ "$PM" == dnf ]]; then
     # Fail early with an explanation instead of a bare dependency error.
@@ -214,7 +246,9 @@ install_php() {
     pkg_install "php${PHP_VERSION}-cli" "php${PHP_VERSION}-fpm" "php${PHP_VERSION}-pgsql" \
       "php${PHP_VERSION}-mbstring" "php${PHP_VERSION}-xml" "php${PHP_VERSION}-curl" \
       "php${PHP_VERSION}-zip" "php${PHP_VERSION}-bcmath" "php${PHP_VERSION}-intl" "php${PHP_VERSION}-gd"
-    pkg_try "php${PHP_VERSION}-opcache" "php${PHP_VERSION}-redis"
+    # OPcache is built into PHP 8.5+, so there is no separate package there.
+    apt-cache show "php${PHP_VERSION}-opcache" >/dev/null 2>&1 && pkg_try "php${PHP_VERSION}-opcache"
+    pkg_try "php${PHP_VERSION}-redis"
     update-alternatives --set php "/usr/bin/php${PHP_VERSION}" >/dev/null 2>&1 || true
   else
     local p="php${PHP_NODOT}-php"
