@@ -42,7 +42,7 @@ systemd-based only.
 
 | Family | Distros | PHP source |
 |--------|---------|------------|
-| Debian | Ubuntu, Debian | [ondrej/php PPA](https://launchpad.net/~ondrej/+archive/ubuntu/php) / [packages.sury.org](https://packages.sury.org) |
+| Debian | Ubuntu (22.04, 24.04, 26.04), Debian | [packages.sury.org/php](https://packages.sury.org/php/) (Ondřej Surý's repository; the old Ubuntu PPA is frozen) |
 | RHEL | RHEL 8+, CentOS Stream, Rocky, AlmaLinux, Oracle Linux | [Remi](https://rpms.remirepo.net) (`phpXY-php-*` packages) |
 | Fedora | Fedora | Remi |
 
@@ -61,7 +61,7 @@ derivatives such as Mint. Containers without systemd also won't work.
 > | Distro | PostgreSQL | certbot | Notes |
 > |--------|-----------|---------|-------|
 > | Ubuntu 24.04 | 16 | 2.9 | |
-> | Ubuntu 26.04 | 18 | 4.0 | PHP 8.5 from Ubuntu itself (the Sury PPA has no packages for 26.04 yet); see notes |
+> | Ubuntu 26.04 | 18 | 4.0 | PHP 8.4 from packages.sury.org; also covers `--clone`/`--install`/`--deploy-key` and `--https` |
 > | Debian 12 | 15 | 2.1 | |
 > | Rocky Linux 9 | 13 | 3.1 | |
 > | AlmaLinux 8 | 16 | 1.22 | uses the `postgresql:16` module stream |
@@ -346,13 +346,17 @@ restore the permissions.
   `/etc/sudoers.d/laravel-prep-path`, so `sudo laravel-app` and
   `sudo -u deploy composer ...` work. Both scripts also add those directories to
   their own `PATH`. Debian/Ubuntu need nothing.
-- **New Debian/Ubuntu releases and PHP 8.4:** PHP comes from Ondřej Surý's repository,
-  which can lag behind a new OS release (on Ubuntu 26.04 its suite exists but has no
-  packages, so `apt install php8.4-cli` fails). If the requested PHP isn't available, the
-  script warns and uses the newest PHP the OS offers (PHP 8.5 on Ubuntu 26.04) and
-  records it in `/etc/laravel-prep/server.conf`. If you passed `--php-version` explicitly
-  it stops instead and tells you which version is available. It also skips the Sury
-  repository altogether when it has no suite for your release.
+- **Ubuntu's frozen PPA:** Ondřej Surý no longer updates `ppa:ondrej/php`; PHP for
+  Ubuntu now comes from `packages.sury.org/php` (the same repository Debian uses), and
+  that is what `laravel-prep.sh` configures. If an earlier run of the script (or you) added
+  the PPA, the script removes that entry when it adds the new repository. The installed
+  PHP packages stay and get their next updates from `packages.sury.org`.
+- **New Debian/Ubuntu releases and PHP versions:** the Sury repository can lag behind a
+  brand-new OS release. If it has no suite for your release it is skipped, and if the
+  requested PHP isn't available the script warns and uses the newest PHP the OS itself
+  offers (for example 8.5 on a release that ships it), recording it in
+  `/etc/laravel-prep/server.conf`. If you passed `--php-version` explicitly it stops
+  instead and tells you which version is available.
 - **RHEL proper** needs an active subscription for the CodeReady Builder repo;
   the script warns and continues if that can't be enabled.
 - **Nginx reloads are asynchronous:** a new vhost can take a second or two to

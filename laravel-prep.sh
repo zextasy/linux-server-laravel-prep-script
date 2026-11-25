@@ -164,26 +164,25 @@ export DEBIAN_FRONTEND=noninteractive
 setup_repos_apt() {
   pkg_update
   pkg_install ca-certificates curl gnupg lsb-release apt-transport-https
-  # Ondrej Sury's PHP repository (PPA on Ubuntu, packages.sury.org on Debian). It lags behind new OS
-  # releases: skip it when it has no suite for this release, and fall back to the distro's own PHP.
-  local release_url
-  if [[ "$FAMILY" == "ubuntu" ]]; then
-    release_url="https://ppa.launchpadcontent.net/ondrej/php/ubuntu/dists/${VERSION_CODENAME}/Release"
-  else
-    release_url="https://packages.sury.org/php/dists/${VERSION_CODENAME}/Release"
-  fi
+  # Ondrej Sury's PHP repository, packages.sury.org/php: used for Debian AND Ubuntu now that his Ubuntu PPA
+  # (ppa:ondrej/php) is frozen. It lags behind brand-new OS releases: skip it when it has no suite for this
+  # release, and fall back to the distro's own PHP.
+  local release_url="https://packages.sury.org/php/dists/${VERSION_CODENAME}/Release"
   if curl -fs --max-time 30 -o /dev/null "$release_url" 2>/dev/null; then
-    if [[ "$FAMILY" == "ubuntu" ]]; then
-      pkg_install software-properties-common
-      add-apt-repository -y ppa:ondrej/php
-    else
-      local tmp; tmp="$(mktemp -d)"
-      curl -fsSL -o "$tmp/keyring.deb" https://packages.sury.org/debsuryorg-archive-keyring.deb
-      dpkg -i "$tmp/keyring.deb"
-      rm -rf "$tmp"
-      echo "deb [signed-by=/usr/share/keyrings/debsuryorg-archive-keyring.gpg] https://packages.sury.org/php/ ${VERSION_CODENAME} main" \
-        > /etc/apt/sources.list.d/php.list
-    fi
+    # A frozen PPA from an earlier run of this script (or by hand): drop it; installed PHP packages stay and
+    # get their next updates from packages.sury.org.
+    local old
+    for old in /etc/apt/sources.list.d/*ondrej*php* /etc/apt/keyrings/*ondrej*php*; do
+      [[ -e "$old" ]] || continue
+      echo "Removing the frozen PHP PPA entry: $old"
+      rm -f "$old"
+    done
+    local tmp; tmp="$(mktemp -d)"
+    curl -fsSL -o "$tmp/keyring.deb" https://packages.sury.org/debsuryorg-archive-keyring.deb
+    dpkg -i "$tmp/keyring.deb"
+    rm -rf "$tmp"
+    echo "deb [signed-by=/usr/share/keyrings/debsuryorg-archive-keyring.gpg] https://packages.sury.org/php/ ${VERSION_CODENAME} main" \
+      > /etc/apt/sources.list.d/php.list
   else
     warn "The Sury PHP repository has no suite for ${VERSION_CODENAME}; not adding it (the distro's own PHP will be used)"
   fi
